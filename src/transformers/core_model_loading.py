@@ -179,7 +179,12 @@ class Concatenate(ConversionOps):
                 all_tensors.extend(tensors)
             else:
                 all_tensors.append(tensors)
-        return {target_pattern: torch.cat(all_tensors, dim=self.dim)}
+        result = torch.cat(all_tensors, dim=self.dim)
+        # Release source refs eagerly so accelerator caching allocators (MPS/CUDA) can pool/reclaim
+        # buffers immediately instead of waiting for the caller to drop the input_dict.
+        all_tensors.clear()
+        input_dict.clear()
+        return {target_pattern: result}
 
     def get_target_pattern(self, target_patterns: list[str]) -> str:
         # Here we always return the target pattern
@@ -246,7 +251,7 @@ class MergeModulelist(ConversionOps):
             tensors = input_dict.pop(source_pattern)
             target_pattern = self.get_target_pattern(input_size, source_pattern, target_patterns)
             # DecompressExperts pre-allocates a stacked tensor to avoid holding N individual
-            # decompressed tensors simultaneously.  Pass it through to skip the redundant copy
+            # decompressed tensors simultaneously. Pass it through to skip the redundant copy
             # that torch.stack would otherwise make.
             if isinstance(tensors, torch.Tensor):
                 merged[target_pattern] = tensors
@@ -646,6 +651,8 @@ class ErnieFuseAndSplitTextVisionExperts(ConversionOps):
 
         for k, v in split_and_fused.items():
             split_and_fused[k] = torch.cat(v, dim=self.concat_dim)
+        # Eager release of per-source tensor lists once the fused outputs are built.
+        input_dict.clear()
 
         return split_and_fused
 
@@ -1748,6 +1755,10 @@ def convert_and_load_state_dict_in_model(
         else:
             _add_unmatched_checkpoint_key(renamed_key, model, loading_info)
 
+    # When loading onto MPS, periodically drain the MPS allocator pool back to the system so
+    # buffers from completed converter stages don't accumulate and push us into swap. CUDA's pool
+    # is already pressure-aware; MPS's is not.
+    mps_target = torch.backends.mps.is_available() and any(str(d).startswith("mps") for d in device_map.values())
     try:
         for first_param_name, mapping in tqdm(param_name_to_load.items(), desc="Loading weights"):
             try:
@@ -1777,6 +1788,8 @@ def convert_and_load_state_dict_in_model(
 
                 # Cleanup all the tensors that were gathered before next iteration
                 del realized_value
+                if mps_target:
+                    torch.mps.empty_cache()
 
             except SkipParameters:
                 continue
