@@ -106,6 +106,18 @@ if is_torch_available():
     ]
 
     _LLAMA_CONVERTERS = _LLAMA_SHARED_RENAMES + _NORM_RENAMES + _ROPE_ATTN_CONVERTERS
+    # Qwen2/3 use NeoX-style split-half RoPE, and llama.cpp stores their Q/K weights in the
+    # original Hugging Face order. Llama-style reverse permutation would corrupt attention.
+    _QWEN_CONVERTERS = (
+        _LLAMA_SHARED_RENAMES
+        + _NORM_RENAMES
+        + [
+            WeightRenaming(r"\.attn_(q|k)\.weight", r".self_attn.\1_proj.weight"),
+        ]
+    )
+    _QWEN3_CONVERTERS = _QWEN_CONVERTERS + [
+        WeightRenaming(r"\.attn_(q|k)_norm\.weight", r".self_attn.\1_norm.weight"),
+    ]
     _NEMOTRON_CONVERTERS = _LLAMA_SHARED_RENAMES + _NORM_SUBTRACT_ONE_CONVERTERS + _ROPE_ATTN_CONVERTERS
 
     # Gemma-2/3 have four layer norms per block (input + post-attention + pre-ffn + post-ffn)
@@ -270,7 +282,7 @@ if is_torch_available():
         WeightRenaming(r"\.ffn_(gate|up|down)_shexp\.weight", r".mlp.shared_expert.\1_proj.weight"),
         WeightRenaming(r"\.ffn_gate_inp\.weight", ".mlp.gate.weight"),
         WeightRenaming(r"\.ffn_down_exps\.weight", ".mlp.experts.down_proj"),
-        *_ROPE_ATTN_CONVERTERS,
+        WeightRenaming(r"\.attn_(q|k)\.weight", r".self_attn.\1_proj.weight"),
         WeightConverter(
             source_patterns=r"\.ffn_gate_inp_shexp",
             target_patterns=".mlp.shared_expert_gate",
@@ -375,8 +387,8 @@ if is_torch_available():
         "mistral": _LLAMA_CONVERTERS,
         "phi3": _LLAMA_CONVERTERS,
         "cohere": _LLAMA_CONVERTERS,
-        "qwen2": _LLAMA_CONVERTERS,
-        "qwen3": _LLAMA_CONVERTERS,
+        "qwen2": _QWEN_CONVERTERS,
+        "qwen3": _QWEN3_CONVERTERS,
         "deci": _LLAMA_CONVERTERS,
         # Norm-subtract-one variants
         "nemotron": _NEMOTRON_CONVERTERS,

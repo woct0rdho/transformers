@@ -15,6 +15,7 @@ so they can run on every PR without RUN_SLOW.
 
 from __future__ import annotations
 
+import re
 import unittest
 
 from parameterized import parameterized
@@ -81,6 +82,22 @@ class GgufArchCoverageTests(unittest.TestCase):
                 (WeightRenaming, WeightConverter),
                 f"{model_type}: every entry must be a WeightRenaming or WeightConverter, got {type(rule).__name__}",
             )
+
+    def test_qwen_neox_rope_weights_are_not_permuted(self):
+        """Qwen GGUF files retain Hugging Face's split-half Q/K layout for NeoX RoPE."""
+        from transformers.gguf_conversion_ops import ReversePermuteAttnK, ReversePermuteAttnQ
+
+        for model_type in ("qwen2", "qwen3", "qwen2_moe", "qwen3_moe"):
+            rules = get_gguf_converters(model_type)
+            source_patterns = [source for rule in rules for source in rule.source_patterns]
+            self.assertTrue(any(re.search(source, "model.layers.0.attn_q.weight") for source in source_patterns))
+            self.assertTrue(any(re.search(source, "model.layers.0.attn_k.weight") for source in source_patterns))
+            for rule in rules:
+                if isinstance(rule, WeightConverter):
+                    self.assertFalse(
+                        any(isinstance(op, ReversePermuteAttnQ | ReversePermuteAttnK) for op in rule.operations),
+                        f"{model_type}: Q/K weights must not receive Llama-style permutation.",
+                    )
 
     def test_quantizer_prepends_gguf_dequantize_to_every_converter(self):
         """``GGUFQuantizer.update_weight_conversions`` injects ``GGUFDequantize`` at the head
