@@ -938,6 +938,9 @@ class WeightTransform:
             renamed_key = prefix_dot + renamed_key
         return renamed_key, source_pattern_that_matched
 
+    def convert(self, layer_name: str, **kwargs) -> dict[str, list[torch.Tensor]]:
+        raise NotImplementedError
+
     def reverse_transform(self) -> WeightTransform:
         """Reverse the current `WeightTransform` instance, to be able to save with the opposite weight transformations."""
         # TODO: check this and relax when quantizer have `reverse_op`
@@ -1376,8 +1379,11 @@ def set_param_for_module(
         # For DTensor parameters, compare against the local shard loaded on this rank.
         expected_shape = ref._local_tensor.shape if is_dtensor(ref) else ref.shape
 
-        if ref is not None and param_value.shape != expected_shape and hf_quantizer is None:
-            loading_info.mismatched_keys.add((target_name, param_value.shape, expected_shape))
+        logical_shape = getattr(param_value, "logical_shape", None)
+        checked_shape = torch.Size(logical_shape) if logical_shape is not None else param_value.shape
+        enforce_shape = logical_shape is not None or hf_quantizer is None
+        if ref is not None and checked_shape != expected_shape and enforce_shape:
+            loading_info.mismatched_keys.add((target_name, checked_shape, expected_shape))
         else:
             if is_dtensor(ref):
                 local_param = param_value.detach() if isinstance(param_value, torch.nn.Parameter) else param_value
@@ -1386,7 +1392,7 @@ def set_param_for_module(
                     dtensor_param, requires_grad=ref.requires_grad and dtensor_param.is_floating_point()
                 )
             # super important otherwise _init_weight will re-init the param
-            param_value._is_hf_initialized = True
+            setattr(param_value, "_is_hf_initialized", True)
             setattr(module_obj, param_name, param_value)
 
 
@@ -1665,7 +1671,7 @@ def convert_and_load_state_dict_in_model(
 
         # 2. finally, collect the tensor into the proper converter
         if renamed_key in meta_model_state_dict:
-            empty_param = meta_model_state_dict.get(renamed_key)
+            empty_param = meta_model_state_dict[renamed_key]
             # If we enter here, we have a WeightConverter operation to perform
             if source_pattern is not None:
                 new_converter = deepcopy(pattern_to_converter[source_pattern])
@@ -1675,14 +1681,9 @@ def convert_and_load_state_dict_in_model(
             else:
                 mapping = param_name_to_load.setdefault(renamed_key, WeightRenaming(original_key, renamed_key))
                 source_pattern = original_key
-                # Pre-quantized loaders (e.g. GGUF) need a dequant op on the rename path:
-                # ``WeightRenaming.convert`` returns the raw quantized tensor directly under
-                # the renamed key, and ``set_param_for_module`` skips the shape check when a
-                # quantizer is active. Without an explicit dequant op the layer would land in
-                # the model as raw bytes cast to fp32 with the wrong (byte-) shape.
-                renaming_dequant = getattr(hf_quantizer, "renaming_dequantize_op", None)
-                if renaming_dequant is not None and mapping.quantization_operation is None:
-                    mapping.quantization_operation = renaming_dequant
+                renaming_quantization_op = getattr(hf_quantizer, "renaming_quantization_op", None)
+                if renaming_quantization_op is not None and mapping.quantization_operation is None:
+                    mapping.quantization_operation = renaming_quantization_op
 
             # 3. Handle dtype casting
             needs_quantization = (
@@ -1694,21 +1695,21 @@ def convert_and_load_state_dict_in_model(
                 mapping.quantization_operation = hf_quantizer.get_quantize_ops()
 
             _dtype = dtype
-            if (
-                hf_quantizer
-                and hf_quantizer.pre_quantized
-                and (
-                    original_key != renamed_key
-                    or not (
+            preserve_checkpoint_dtype = False
+            if hf_quantizer and hf_quantizer.pre_quantized:
+                preserve_dtype_hook = getattr(hf_quantizer, "preserve_checkpoint_dtype", None)
+                if preserve_dtype_hook is not None:
+                    preserve_checkpoint_dtype = preserve_dtype_hook(
+                        tensor, original_key=original_key, renamed_key=renamed_key
+                    )
+                else:
+                    tensor_is_floating_point = (
                         tensor.get_dtype().startswith(("F", "BF"))
                         if hasattr(tensor, "get_dtype")
-                        else tensor.is_floating_point()
+                        else isinstance(tensor, torch.Tensor) and tensor.is_floating_point()
                     )
-                )
-            ):
-                # if the key was renamed as it is not available in the state dict otherwise, it means that we are deserializing it,
-                # so we need to make sure to load the tensor with the same dtype from the checkpoint
-                # TODO: make the condition more srict for native fp8 model such as qwen2moe fp8
+                    preserve_checkpoint_dtype = original_key != renamed_key or not tensor_is_floating_point
+            if preserve_checkpoint_dtype:
                 _dtype = None
             elif dtype_plan != {} and dtype_policy_alt.search(renamed_key):
                 matched_dtype_pattern = dtype_policy_alt.search(renamed_key)

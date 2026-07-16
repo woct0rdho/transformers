@@ -66,6 +66,7 @@ class QuantizationMethod(str, Enum):
     FOUR_OVER_SIX = "fouroversix"
     SINQ = "sinq"
     GEMMA = "gemma"
+    GGUF = "gguf"
 
 
 class AwqFormat(str, Enum):
@@ -1686,6 +1687,20 @@ class SpQRConfig(QuantizationConfigMixin):
             raise ValueError("SpQR currently only supports beta2 = 16")
         if not isinstance(self.shapes, dict):
             raise TypeError("shapes must be a dict")
+
+
+@dataclass
+class GGUFConfig(QuantizationConfigMixin):
+    """Configuration for loading pre-quantized GGUF checkpoints.
+
+    Args:
+        architecture (`str`, *optional*):
+            GGUF architecture selected while parsing the checkpoint metadata.
+    """
+
+    def __init__(self, architecture: str | None = None, **kwargs):
+        self.quant_method = QuantizationMethod.GGUF
+        self.architecture = architecture
 
 
 @dataclass

@@ -442,7 +442,7 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
             and only loads the metadata in memory.
     """
     if is_gguf_available() and is_torch_available():
-        from gguf import GGUFReader
+        from gguf import GGMLQuantizationType, GGUFReader
     else:
         logger.error(
             "Loading a GGUF checkpoint in PyTorch, requires both PyTorch and GGUF>=0.10.0 to be installed. Please see "
@@ -614,17 +614,31 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
         config = parsed_parameters.get("config", {})
         model_type = config.get("model_type", architecture)
 
-        # Wrap raw uint8 bytes in a ``torch.Tensor`` subclass that carries ``quant_type``.
-        # ``GGUFDequantize`` does the actual dequant inside the WeightConverter chain,
-        # on whatever device the loader has moved the bytes to.
+        # Keep compressed payloads in a metadata-carrying tensor subclass; F16/F32 values follow normal loading.
+        import warnings
+
         import torch  # local: keep top-of-file import-light when torch isn't required
+
+        def as_torch_tensor(array):
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
+                return torch.from_numpy(array)
 
         # Tensors GGUF ships as metadata for its own runtime but HF models compute on the
         # fly (or don't store as a parameter). Skip so they don't show up as "unexpected".
         _GGUF_RUNTIME_AUX_TENSORS = frozenset({"rope_freqs.weight"})
 
+        float_types = {GGMLQuantizationType.F16, GGMLQuantizationType.F32}
         parsed_parameters["tensors"] = {
-            tensor.name: GGUFQuantizedTensor(torch.from_numpy(tensor.data), quant_type=tensor.tensor_type)
+            tensor.name: (
+                as_torch_tensor(tensor.data)
+                if tensor.tensor_type in float_types
+                else GGUFQuantizedTensor(
+                    as_torch_tensor(tensor.data),
+                    quant_type=tensor.tensor_type,
+                    logical_shape=tuple(int(dim) for dim in reversed(tensor.shape)),
+                )
+            )
             for tensor in reader.tensors
             if tensor.name not in _GGUF_RUNTIME_AUX_TENSORS
         }

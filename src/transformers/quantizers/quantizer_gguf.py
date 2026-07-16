@@ -11,89 +11,143 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GGUF quantizer.
-
-The state-dict produced by ``load_gguf_checkpoint`` contains
-:class:`GGUFQuantizedTensor` instances — ``torch.Tensor`` subclasses that
-carry raw uint8 bytes plus the per-tensor ``quant_type`` metadata. They flow
-through the standard loader unchanged (``.to(device)`` preserves the
-subclass via ``__torch_function__``), and the :class:`GGUFDequantize` op
-injected at the head of every ``WeightConverter`` produces the final
-floating-point tensor — same pattern as :class:`Fp8Dequantize` for FP8.
-"""
+"""GGUF quantizer lifecycle integration."""
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+from ..utils import logging
 from .base import HfQuantizer
 
 
+if TYPE_CHECKING:
+    from ..utils.quantization_config import GGUFConfig
+
+
+logger = logging.get_logger(__name__)
+
+
 class GGUFQuantizer(HfQuantizer):
-    """Quantizer for GGUF checkpoints — carries the rename table and injects ``GGUFDequantize``."""
+    """Load GGUF checkpoints persistently for dense Qwen3 or dequantize as a compatibility fallback."""
 
     requires_calibration = False
+    quantization_config: GGUFConfig
 
-    def __init__(self, weight_mapping=None, **kwargs):
-        # ``pre_quantized=True`` so the loader keeps `_dtype=None` (no uint8→float
-        # cast in ``spawn_materialize`` — the GGUFDequantize op handles dtype).
+    def __init__(self, quantization_config: GGUFConfig | None = None, weight_mapping=None, **kwargs):
+        if quantization_config is None:
+            from ..utils.quantization_config import GGUFConfig
+
+            quantization_config = GGUFConfig()
         kwargs.setdefault("pre_quantized", True)
-        super().__init__(quantization_config=None, **kwargs)
+        super().__init__(quantization_config=quantization_config, **kwargs)
+        self.persistent = quantization_config.architecture == "qwen3"
+        self.compute_dtype = None
         self.weight_mapping = list(weight_mapping or [])
+        self.checkpoint_storage_bytes = {}
+        self.param_storage_bytes = {}
+
+    def update_dtype(self, dtype):
+        self.compute_dtype = dtype
+        return dtype
+
+    def validate_environment(self, *args, **kwargs):
+        if self.quantization_config.architecture and not self.persistent:
+            logger.warning_once(
+                f"Persistent GGUF weights currently support dense Qwen3 only; "
+                f"{self.quantization_config.architecture!r} will use load-time dequantization."
+            )
+
+    def set_weight_mapping(self, weight_mapping, checkpoint_tensors=None):
+        self.weight_mapping = list(weight_mapping or [])
+        self.checkpoint_storage_bytes = {
+            name: tensor.numel() * tensor.element_size() for name, tensor in (checkpoint_tensors or {}).items()
+        }
 
     @property
-    def renaming_dequantize_op(self):
-        """Op the loader attaches to freshly-constructed ``WeightRenaming``s so the
-        rename path produces dequantized fp32 (not raw GGUF bytes cast to fp32)."""
+    def renaming_quantization_op(self):
+        if self.persistent:
+            from ..gguf_conversion_ops import GGUFSetMetadata
+
+            return GGUFSetMetadata()
+
         from ..gguf_conversion_ops import GGUFDequantize
 
         return GGUFDequantize()
 
     def update_weight_conversions(self, weight_conversions):
-        """Prepend the GGUF→HF rename table and inject ``GGUFDequantize`` at the head of every
-        ``WeightConverter`` — same pattern as ``Fp8Quantizer.update_weight_conversions``.
+        from copy import deepcopy
 
-        ``WeightRenaming`` entries also need dequant on the rename path: ``WeightRenaming.convert``
-        returns the source ``GGUFQuantizedTensor`` directly under the renamed key, and
-        ``set_param_for_module`` skips the shape check when a quantizer is active, so otherwise
-        ``v_proj`` / ``o_proj`` / FFN projs / RMSNorms / embeddings would land in the model as
-        uint8-bytes-cast-to-float32 with the wrong (byte-) shape. Attaching ``GGUFDequantize``
-        as the ``quantization_operation`` on each renaming routes them through the dequant op
-        (``WeightRenaming.convert`` runs ``self.quantization_operation`` when ``hf_quantizer`` is
-        active), producing the correctly-expanded fp32 tensor.
-        """
-        from ..core_model_loading import WeightConverter, WeightRenaming
-        from ..gguf_conversion_ops import GGUFDequantize
+        from ..core_model_loading import WeightConverter, WeightRenaming, rename_source_key
+        from ..gguf_conversion_ops import GGUFDequantize, GGUFSetMetadata
 
         injected = []
-        for conv in self.weight_mapping:
-            if isinstance(conv, WeightConverter):
-                conv = WeightConverter(
-                    source_patterns=conv._original_source_patterns,
-                    target_patterns=conv._original_target_patterns,
-                    operations=[GGUFDequantize(), *conv.operations],
+        for conversion in self.weight_mapping:
+            if not isinstance(conversion, WeightConverter):
+                injected.append(conversion)
+                continue
+
+            if self.persistent:
+                operations = [GGUFSetMetadata(), *conversion.operations]
+            else:
+                operations = [GGUFDequantize(), *conversion.operations]
+
+            injected.append(
+                WeightConverter(
+                    source_patterns=conversion._original_source_patterns,
+                    target_patterns=conversion._original_target_patterns,
+                    operations=operations,
                 )
-            elif isinstance(conv, WeightRenaming):
-                conv.quantization_operation = GGUFDequantize()
-            injected.append(conv)
-        return injected + list(weight_conversions)
+            )
+
+        updated_conversions = injected + list(weight_conversions)
+        if self.persistent and self.checkpoint_storage_bytes:
+            sizing_conversions = deepcopy(updated_conversions)
+            renamings = [entry for entry in sizing_conversions if isinstance(entry, WeightRenaming)]
+            converters = [entry for entry in sizing_conversions if isinstance(entry, WeightConverter)]
+            self.param_storage_bytes = {}
+            for source_name, storage_bytes in sorted(self.checkpoint_storage_bytes.items()):
+                target_name, _ = rename_source_key(source_name, renamings, converters)
+                self.param_storage_bytes[target_name] = self.param_storage_bytes.get(target_name, 0) + storage_bytes
+
+        return updated_conversions
+
+    def preserve_checkpoint_dtype(self, tensor, **kwargs):
+        from ..integrations.gguf_dequant import GGUFQuantizedTensor
+
+        return isinstance(tensor, GGUFQuantizedTensor)
+
+    def param_element_size(self, model, param_name, param):
+        if self.persistent and param_name in self.param_storage_bytes and param.numel() > 0:
+            return self.param_storage_bytes[param_name] / param.numel()
+        return super().param_element_size(model, param_name, param)
 
     def param_needs_quantization(self, model, param_name, **kwargs):
-        # TODO: for on the fly quantization :)
         return False
 
-    def preprocess_model(self, model, **kwargs):
-        # No module swapping needed; skip the base class logic that tries to
-        # set is_quantized / quantization_method on the model.
-        pass
-
     def _process_model_before_weight_loading(self, model, **kwargs):
-        pass
+        if self.persistent:
+            from ..integrations.gguf import replace_with_gguf_modules
+            from ..utils import is_torch_available
 
-    def postprocess_model(self, model, **kwargs):
-        # GGUF loading does not set any quantization config on the model.
-        pass
+            if is_torch_available():
+                import torch
+
+                device_map = kwargs.get("device_map") or {}
+                target_devices = device_map.values() if isinstance(device_map, dict) else [device_map]
+                uses_rocm = torch.version.hip is not None and any(
+                    str(device).startswith("cuda") for device in target_devices
+                )
+                if uses_rocm and model.config._attn_implementation == "sdpa":
+                    logger.warning_once("GGUF on ROCm uses eager attention because SDPA is unstable for this path.")
+                    model.config._attn_implementation = "eager"
+            replace_with_gguf_modules(model, compute_dtype=self.compute_dtype)
+        return model
 
     def _process_model_after_weight_loading(self, model, **kwargs):
-        pass
+        if not self.persistent:
+            self.remove_quantization_config(model)
+        return model
 
     @property
     def is_trainable(self):

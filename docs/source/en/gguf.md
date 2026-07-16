@@ -24,34 +24,39 @@ rendered properly in your Markdown viewer.
 
 The GGUF format also supports many quantized data types (refer to [quantization type table](https://hf.co/docs/hub/en/gguf#quantization-types) for a complete list of supported quantization types) which saves a significant amount of memory, making inference with large models like Whisper and Llama feasible on local and edge devices.
 
-Transformers supports loading models stored in the GGUF format for further training or finetuning. The GGUF checkpoint is **dequantized lazily on the target device** by the conversion-mapping pipeline (see [Adding GGUF support for a new architecture](#adding-gguf-support-for-a-new-architecture) below for how that's plugged in).
+Transformers supports two GGUF loading modes. Qwen3 and Qwen3-MoE checkpoints keep quantized payloads as frozen model parameters and dequantize weights during `forward`. Other registered architectures use the compatibility path, which dequantizes weights while loading. Both modes use the normal Transformers quantizer lifecycle and weight-conversion pipeline.
 
 > [!TIP]
-> Architectures wired up for GGUF loading include Llama, Mistral, Phi3, Cohere, Qwen2, Qwen3, Deci, StableLM, Starcoder2, Nemotron, Gemma2, Gemma3 (text + multimodal), Bloom, GPT2, Mamba, LFM2, Falcon, Qwen2-MoE, Qwen3-MoE, MiniMax-M2, GPT-OSS, T5, UMT5. The authoritative list is the `_GGUF_ARCH_CONVERTERS` mapping in [`modeling_gguf_pytorch_utils.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_gguf_pytorch_utils.py).
+> Architectures wired up for GGUF loading include Llama, Mistral, Phi3, Cohere, Qwen2, Qwen3, Deci, StableLM, Starcoder2, Nemotron, Gemma2, Gemma3 (text + multimodal), Gemma4, Bloom, GPT2, Mamba, LFM2, Falcon, Qwen2-MoE, Qwen3-MoE, MiniMax-M2, GPT-OSS, T5, UMT5. Qwen3 and Qwen3-MoE currently have persistent quantized weights. The authoritative registry is `_GGUF_ARCH_CONVERTERS` in [`modeling_gguf_pytorch_utils.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_gguf_pytorch_utils.py).
 
 Add the `gguf_file` parameter to [`~PreTrainedModel.from_pretrained`] to specify the GGUF file to load.
 
 ```py
-# pip install gguf
+# pip install gguf accelerate
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model_id = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"
-filename = "tinyllama-1.1b-chat-v1.0.Q6_K.gguf"
+model_id = "Qwen/Qwen3-0.6B-GGUF"
+filename = "Qwen3-0.6B-Q4_K_M.gguf"
 
-dtype = torch.float32 # could be torch.float16 or torch.bfloat16 too
-tokenizer = AutoTokenizer.from_pretrained(model_id, gguf_file=filename)
-model = AutoModelForCausalLM.from_pretrained(model_id, gguf_file=filename, dtype=dtype)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    gguf_file=filename,
+    dtype=torch.bfloat16,
+    device_map="auto",
+)
+# Loading tokenizer files from the corresponding Transformers repository is
+# a reliable fallback when a particular GGUF tokenizer cannot be converted.
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 ```
 
-Once you're done tinkering with the model, save and convert it back to the GGUF format with the [convert-hf-to-gguf.py](https://github.com/ggerganov/llama.cpp/blob/master/convert_hf_to_gguf.py) script.
+Persistent Qwen3 models dequantize linear weights only for the active operation. Embeddings dequantize only requested token rows. The tied language-model head shares the compressed embedding payload rather than duplicating it, and dequantizes its complete logical weight for projection like other GGUF linear modules. When autograd needs a packed linear's input gradient, backward re-dequantizes that weight instead of retaining the forward's dense weight.
 
-```py
-tokenizer.save_pretrained("directory")
-model.save_pretrained("directory")
+Persistent GGUF linear and embedding modules use the load-time `dtype` as their shared compute policy while keeping packed storage in `uint8`. Linear outputs preserve the activation input dtype; embedding outputs use the configured compute dtype. Ordinary floating-point fallback weights retain native PyTorch layer dtype behavior. GGUF linear and embedding modules are initialized by the checkpoint loader and reject forward calls while they still contain raw placeholder weights. Packed embeddings support `padding_idx`, but reject `max_norm`, non-default `norm_type`, `scale_grad_by_freq=True`, and `sparse=True` because packed base weights are immutable and frozen.
 
-!python ${path_to_llama_cpp}/convert-hf-to-gguf.py ${directory}
-```
+Disk offload, base-weight training, TP/DTensor sharding, and saving persistent GGUF parameters with `save_pretrained` are not supported yet. Load persistent GGUF models with the desired `dtype`; casting the complete model to another dtype after loading is not supported. Device-only moves remain supported, and tied compressed parameters keep shared storage across those moves. PEFT-style adapters can still train because activation and adapter gradients are preserved. Packed dense linears save only their compressed payload for input-gradient computation and re-dequantize during backward. On ROCm, persistent GGUF currently selects eager attention because SDPA is unstable for this execution path.
+
+Architectures on the compatibility path are ordinary dequantized models after loading and can be trained or saved normally. Convert a saved Transformers model back to GGUF with [convert-hf-to-gguf.py](https://github.com/ggerganov/llama.cpp/blob/master/convert_hf_to_gguf.py).
 
 ## Adding GGUF support for a new architecture
 
@@ -83,7 +88,7 @@ WeightConverter(
 
 `WeightRenaming`s are applied **sequentially** (each one operates on the previous rule's output), so structural prefix renames (`^blk\.` → `model.layers.`, etc.) should come first and per-tensor renames after. `WeightConverter`s are evaluated after all renames; the first one whose source pattern matches is selected.
 
-`GGUFDequantize` is automatically prepended to every `WeightConverter`'s op chain by `GGUFQuantizer.update_weight_conversions` — same pattern as `Fp8Dequantize` for FP8. You don't need to add it manually.
+The GGUF quantizer adapts these rules to the selected runtime. The compatibility path prepends `GGUFDequantize` to converter chains. Persistent Qwen3 paths instead keep compressed tensors and attach only the metadata required by each architecture rule, so architecture rules should never add `GGUFDequantize` directly. Qwen3-MoE rewrites its gate/up many-to-one converter into two direct renames because compressed tensors with independent quantization metadata cannot be concatenated. Qwen2 and Qwen3 use NeoX-style split-half RoPE and retain the original Hugging Face Q/K layout in GGUF; unlike Llama, their Q/K weights must not be permuted while loading.
 
 ### Existing transform ops
 
@@ -91,7 +96,7 @@ These live in [`src/transformers/gguf_conversion_ops.py`](https://github.com/hug
 
 | Op | Used for |
 |----|----------|
-| `ReversePermuteAttnQ`, `ReversePermuteAttnK` | Llama-family rope-permuted Q/K weights |
+| `ReversePermuteAttnQ`, `ReversePermuteAttnK` | Architectures such as Llama whose GGUF conversion permutes Q/K weights |
 | `SubtractOne` | Gemma / Nemotron norm weights (stored as `weight + 1` in GGUF) |
 | `Unsqueeze(dim)` | Mamba conv1d, LFM2 shortconv — add a singleton dim |
 | `LogNegate` | Mamba SSM-A: `log(-x)` on load |
@@ -126,6 +131,8 @@ For a wholly new layout, start from one of the existing entries (`_BLOOM_CONVERT
 
 ### Dequantization performance
 
-The actual byte-level dequant happens inside the `GGUFDequantize` op via [`integrations/gguf_dequant.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/integrations/gguf_dequant.py) — a pure-PyTorch port of [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) (same kernels diffusers uses). It supports Q4_0/Q4_1, Q5_0/Q5_1, Q8_0, Q2_K…Q6_K, IQ4_NL, IQ4_XS, BF16, F16, F32 and runs on CPU or GPU/MPS unchanged — the loader moves the raw uint8 bytes to the target device first, then the kernel produces the float tensor on-device.
+Byte-level dequantization is exposed through [`integrations/gguf_dequant.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/integrations/gguf_dequant.py), with kernels adapted from llama.cpp in `integrations/gguf_dequant_kernels.py`. The kernels run on CPU, CUDA/ROCm, and MPS through PyTorch operations. Supported formats include F32, F16, BF16, Q4_0/Q4_1, Q5_0/Q5_1, Q8_0, Q2_K through Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4, and NVFP4.
 
-If you add a new quant type, add the corresponding `_dq_<TYPE>` kernel to `gguf_dequant.py` and register it in `_build_dispatch()`.
+Persistent Qwen3 memory is the compressed payload plus ordinary unquantized tensors. Dense temporary workspace includes one complete active linear projection, including the full dequantized language-model head, or the selected embedding rows. A grad-enabled packed linear releases its dense weight after forward and materializes it again only while computing its input gradient; autograd retains the packed payload reference rather than the logical floating-point matrix. Qwen3-MoE workspace scales with routed experts: one expert at a time for eager, the unique active set for grouped, and routed token-expert pairs for batched. Allocator warmup and automatic device mapping use each checkpoint tensor's physical byte count rather than its logical placeholder size. The PyTorch allocator may retain reserved memory after a forward, so compare `memory_allocated` after loading and peak allocated deltas rather than reserved-memory totals.
+
+If you add a quantization type, add its block kernel and dispatch entry in `gguf_dequant_kernels.py`, then compare representative blocks against gguf-py in the download-free GGUF tests.

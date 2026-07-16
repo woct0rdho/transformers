@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import copy
+import tempfile
 import unittest
 
+from transformers import GGUFConfig
 from transformers.testing_utils import require_gguf, require_torch
 from transformers.utils import is_gguf_available, is_torch_available
 
@@ -25,6 +27,8 @@ if is_torch_available():
 
     from transformers.integrations.gguf import GGUFEmbedding, GGUFLinear
     from transformers.integrations.gguf_dequant import GGUFQuantizedTensor, dequantize_gguf_tensor
+    from transformers.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
+    from transformers.quantizers.quantizer_gguf import GGUFQuantizer
 
 if is_gguf_available():
     import gguf
@@ -474,6 +478,146 @@ class GGUFOnDemandTests(unittest.TestCase):
         self.assertIsNone(base.weight.grad)
         self.assertIsNotNone(adapter.weight.grad)
         self.assertFalse(torch.equal(before, adapter.weight))
+
+    def test_qwen3_replacement_compute_dtype_and_tied_parameter(self):
+        config = Qwen3Config(
+            vocab_size=8,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+            tie_word_embeddings=True,
+        )
+        with torch.device("meta"):
+            model = Qwen3ForCausalLM(config)
+        logical_num_parameters = model.num_parameters()
+        quantizer = GGUFQuantizer(GGUFConfig(architecture="qwen3"))
+        quantizer.update_dtype(torch.float32)
+        quantizer.preprocess_model(model, dtype=torch.float32, device_map={"": "cpu"})
+        self.assertIsInstance(model.model.embed_tokens, GGUFEmbedding)
+        self.assertIsInstance(getattr(model.model.layers[0].self_attn, "q_proj"), GGUFLinear)
+        self.assertIsInstance(model.lm_head, GGUFLinear)
+        self.assertEqual(model.model.embed_tokens.compute_dtype, torch.float32)
+        self.assertEqual(model.lm_head.compute_dtype, torch.float32)
+
+        full_weight = torch.arange(64, dtype=torch.float32).reshape(8, 8) / 64
+        compressed = GGUFQuantizedTensor(
+            torch.from_numpy(_float_bytes(full_weight)),
+            quant_type=gguf.GGMLQuantizationType.F32,
+            logical_shape=full_weight.shape,
+        )
+        model.model.embed_tokens.weight = compressed
+        missing_keys = {"lm_head.weight"}
+        model.tie_weights(missing_keys=missing_keys, recompute_mapping=False)
+        self.assertIs(model.lm_head.weight, model.model.embed_tokens.weight)
+        self.assertNotIn("lm_head.weight", missing_keys)
+        self.assertEqual(model.num_parameters(), logical_num_parameters)
+        self.assertLess(model.get_memory_footprint(), logical_num_parameters * torch.finfo(torch.float32).bits // 8)
+        with self.assertRaisesRegex(ValueError, "Casting a persistent GGUF model"):
+            getattr(model, "to")(dtype=torch.bfloat16)
+
+    def test_tiny_qwen3_forward_and_generation_after_persistent_replacement(self):
+        torch.manual_seed(0)
+        config = Qwen3Config(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            tie_word_embeddings=True,
+            bos_token_id=0,
+            eos_token_id=1,
+            pad_token_id=0,
+        )
+        model = Qwen3ForCausalLM(config).eval()
+        input_ids = torch.tensor([[2, 5, 7, 3]])
+        with torch.no_grad():
+            expected_logits = model(input_ids).logits
+
+        source_parameters = {}
+        for name, module in model.named_modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
+                source_parameters[f"{name}.weight"] = module.weight.detach().clone()
+                if getattr(module, "bias", None) is not None:
+                    source_parameters[f"{name}.bias"] = module.bias.detach().clone()
+
+        quantizer = GGUFQuantizer(GGUFConfig(architecture="qwen3"))
+        quantizer.update_dtype(torch.float32)
+        quantizer.preprocess_model(model, dtype=torch.float32, device_map={"": "cpu"})
+        for name, module in model.named_modules():
+            if isinstance(module, (GGUFLinear, GGUFEmbedding)):
+                full_weight = source_parameters[f"{name}.weight"]
+                module.weight = GGUFQuantizedTensor(
+                    torch.from_numpy(_float_bytes(full_weight)),
+                    quant_type=gguf.GGMLQuantizationType.F32,
+                    logical_shape=full_weight.shape,
+                )
+                bias_name = f"{name}.bias"
+                if bias_name in source_parameters:
+                    module.bias = torch.nn.Parameter(source_parameters[bias_name])
+        model.tie_weights()
+
+        with torch.no_grad():
+            actual_logits = model(input_ids).logits
+        torch.testing.assert_close(actual_logits, expected_logits, rtol=1e-5, atol=1e-6)
+        generated = model.generate(input_ids, max_new_tokens=2, do_sample=False)
+        self.assertEqual(generated.shape, (1, input_ids.shape[1] + 2))
+
+    def test_qwen3_module_sizing_uses_physical_checkpoint_storage(self):
+        from transformers.integrations.accelerate import compute_module_sizes
+        from transformers.modeling_gguf_pytorch_utils import get_gguf_converters
+        from transformers.modeling_utils import expand_device_map, get_total_byte_count
+
+        config = Qwen3Config(
+            vocab_size=8,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+            tie_word_embeddings=True,
+        )
+        with torch.device("meta"):
+            model = Qwen3ForCausalLM(config)
+        weight_mapping = get_gguf_converters("qwen3")
+        quantizer = GGUFQuantizer(GGUFConfig(architecture="qwen3"), weight_mapping=weight_mapping)
+        checkpoint_tensor = GGUFQuantizedTensor(
+            torch.empty((8, 2), dtype=torch.uint8),
+            quant_type=gguf.GGMLQuantizationType.Q5_K,
+            logical_shape=(8, 8),
+        )
+        quantizer.set_weight_mapping(weight_mapping, {"token_embd.weight": checkpoint_tensor})
+        quantizer.preprocess_model(model, dtype=torch.float32, device_map={"": "cpu"})
+        quantizer.update_weight_conversions([])
+
+        module_sizes, _ = compute_module_sizes(model, quantizer, only_modules=False)
+        self.assertEqual(module_sizes["model.embed_tokens.weight"], checkpoint_tensor.storage_nbytes)
+        expected_keys = [name for name, _ in model.named_parameters()] + [name for name, _ in model.named_buffers()]
+        device_map = expand_device_map({"": "cpu"}, expected_keys)
+        total_byte_count = get_total_byte_count(model, device_map, quantizer)
+        self.assertEqual(list(total_byte_count.values()), [module_sizes[""]])
+
+    def test_persistent_qwen3_save_pretrained_is_rejected(self):
+        config = Qwen3Config(
+            vocab_size=8,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+        )
+        model = Qwen3ForCausalLM(config)
+        quantizer = GGUFQuantizer(GGUFConfig(architecture="qwen3"))
+        quantizer.preprocess_model(model, dtype=torch.float32, device_map={"": "cpu"})
+        object.__setattr__(model, "hf_quantizer", quantizer)
+        with tempfile.TemporaryDirectory() as tmpdir, self.assertRaisesRegex(ValueError, "not serializable"):
+            model.save_pretrained(tmpdir)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ from ..utils.quantization_config import (
     FourOverSixConfig,
     FPQuantConfig,
     GemmaQuantizationConfig,
+    GGUFConfig,
     GPTQConfig,
     HiggsConfig,
     HqqConfig,
@@ -58,6 +59,7 @@ from .quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
 from .quantizer_fouroversix import FourOverSixHfQuantizer
 from .quantizer_fp_quant import FPQuantHfQuantizer
 from .quantizer_gemma import GemmaQuantizer
+from .quantizer_gguf import GGUFQuantizer
 from .quantizer_gptq import GptqHfQuantizer
 from .quantizer_higgs import HiggsHfQuantizer
 from .quantizer_hqq import HqqHfQuantizer
@@ -102,6 +104,7 @@ AUTO_QUANTIZER_MAPPING = {
     "metal": MetalHfQuantizer,
     "sinq": SinqHfQuantizer,
     "gemma": GemmaQuantizer,
+    "gguf": GGUFQuantizer,
 }
 
 AUTO_QUANTIZATION_CONFIG_MAPPING = {
@@ -131,6 +134,7 @@ AUTO_QUANTIZATION_CONFIG_MAPPING = {
     "metal": MetalConfig,
     "sinq": SinqConfig,
     "gemma": GemmaQuantizationConfig,
+    "gguf": GGUFConfig,
 }
 
 LOADING_ATTRIBUTES_CONFIG_TYPES = (

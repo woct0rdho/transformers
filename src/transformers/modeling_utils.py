@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from functools import partial, wraps
 from itertools import cycle
 from threading import Thread
-from typing import TYPE_CHECKING, Any, TypeVar, get_type_hints, overload
+from typing import TYPE_CHECKING, Any, TypeVar, cast, get_type_hints, overload
 from zipfile import is_zipfile
 
 import torch
@@ -50,6 +50,7 @@ from .conversion_mapping import get_model_conversion_mapping
 from .core_model_loading import (
     WeightConverter,
     WeightRenaming,
+    WeightTransform,
     convert_and_load_state_dict_in_model,
     revert_weight_conversion,
 )
@@ -1057,9 +1058,12 @@ class ModuleUtilsMixin:
             if exclude_embeddings and name in embedding_param_names:
                 continue
             if param.requires_grad or not only_trainable:
+                logical_numel = getattr(param, "logical_numel", None)
+                if logical_numel is not None:
+                    total_params += logical_numel
                 # For 4bit models, we need to multiply the number of parameters by 2 as half of the parameters are
                 # used for the 4bit quantization (uint8 tensors are stored)
-                if is_loaded_in_4bit and isinstance(param, bnb.nn.Params4bit):
+                elif is_loaded_in_4bit and isinstance(param, bnb.nn.Params4bit):
                     if hasattr(param, "element_size"):
                         num_bytes = param.element_size()
                     elif hasattr(param, "quant_storage"):
@@ -1244,6 +1248,28 @@ class PreTrainedModel(
     _supports_flex_attn: bool = False
     # Model's compatible flash kernels (e.g., "kernels-community/flash-mla") defaulting to the first in the list
     _compatible_flash_implementations: list[str] | None = None
+
+    # Tensor-parallelism-related properties
+    # A tensor parallel plan of the form `{"model.layer.mlp.param": "colwise"}` to be applied to the model when TP is enabled.
+    # For top-level models, this attribute is currently defined in respective model code. For base models, this attribute comes
+    # from `config.base_model_tp_plan` during `post_init`.
+    _tp_plan: dict[str, str] = None
+    # Tensor parallel degree to which model is sharded to
+    _tp_size = None
+    # A pipeline parallel plan specifying the layers which may not be present on all ranks when PP is enabled. For top-level
+    # models, this attribute is currently defined in respective model code. For base models, it comes from
+    # `config.base_model_pp_plan` during `post_init`.
+    _pp_plan: dict[str, tuple[str, str]] = None
+    # An expert parallel plan used instead of `_tp_plan` when expert parallelism is enabled. For base models, it comes
+    # from `config.base_model_ep_plan` during `post_init`.
+    _ep_plan: dict[str, str] = None
+    # FSDP2 sharding plan of the form `{"layers.*": "free_full_weight"}`. For top-level models, this attribute is
+    # defined on the head class (e.g. `*ForCausalLM`). For base models, it comes from `config.base_model_fsdp_plan`
+    # during `post_init`.
+    _fsdp_plan: dict[str, str] = None
+
+    # Conversion mapping used to restore checkpoint naming when saving.
+    _weight_conversions: list[WeightTransform]
 
     # Advanced functionalities support
     supports_gradient_checkpointing: bool = False
@@ -3222,7 +3248,8 @@ class PreTrainedModel(
                 every_n_layers=every_n_layers,
             )
         else:
-            self.apply(partial(self._set_gradient_checkpointing, value=True))
+            legacy_set_gradient_checkpointing = cast(Callable[..., None], self._set_gradient_checkpointing)
+            self.apply(partial(legacy_set_gradient_checkpointing, value=True))
             logger.warning(
                 "You are using an old version of the checkpointing format that is deprecated (We will also silently ignore `gradient_checkpointing_kwargs` in case you passed it)."
                 "Please update to the new format on your modeling file. To use the new format, you need to completely remove the definition of the method `_set_gradient_checkpointing` in your model."
@@ -3290,7 +3317,8 @@ class PreTrainedModel(
                     "You are using an old version of the checkpointing format that is deprecated (We will also silently ignore `gradient_checkpointing_kwargs` in case you passed it)."
                     "Please update to the new format on your modeling file. To use the new format, you need to completely remove the definition of the method `_set_gradient_checkpointing` in your model."
                 )
-                self.apply(partial(self._set_gradient_checkpointing, value=False))
+                legacy_set_gradient_checkpointing = cast(Callable[..., None], self._set_gradient_checkpointing)
+                self.apply(partial(legacy_set_gradient_checkpointing, value=False))
 
         if getattr(self, "_hf_peft_config_loaded", False):
             self.disable_input_require_grads()
@@ -3749,8 +3777,14 @@ class PreTrainedModel(
                     module.cuda(device)
             return self
 
-        if dtype_present_in_args and getattr(self, "quantization_method", None) == QuantizationMethod.QUARK:
+        quantization_method = getattr(self, "quantization_method", None)
+        if dtype_present_in_args and quantization_method == QuantizationMethod.QUARK:
             raise ValueError("Casting a Quark quantized model to a new `dtype` is not supported.")
+        if dtype_present_in_args and quantization_method == QuantizationMethod.GGUF:
+            raise ValueError(
+                "Casting a persistent GGUF model to a new `dtype` is not supported. Load the model with the desired "
+                "`dtype` instead."
+            )
 
         # Checks if the model has been loaded in 4-bit or 8-bit with BNB
         if getattr(self, "quantization_method", None) == QuantizationMethod.BITS_AND_BYTES:
@@ -4272,15 +4306,23 @@ class PreTrainedModel(
         if "experts_implementation" in kwargs:
             config._experts_implementation = kwargs.pop("experts_implementation")
 
+        if gguf_file:
+            quantization_params_from_config = getattr(config, "quantization_config", None) or getattr(
+                config.get_text_config(decoder=True), "quantization_config", None
+            )
+            if quantization_config is not None or quantization_params_from_config is not None:
+                raise ValueError(
+                    "You cannot combine a separate `quantization_config` with a model loaded from a GGUF file."
+                )
+            from .utils.quantization_config import GGUFConfig
+
+            config.quantization_config = GGUFConfig(architecture=config.model_type).to_dict()
+
         hf_quantizer, config, device_map = get_hf_quantizer(
             config, quantization_config, device_map, weights_only, user_agent
         )
 
         if gguf_file:
-            if hf_quantizer is not None:
-                raise ValueError(
-                    "You cannot combine Quantization and loading a model from a GGUF file, try again by making sure you did not passed a `quantization_config` or that you did not load a quantized model from the Hub."
-                )
             if device_map is not None and (
                 (isinstance(device_map, dict) and "disk" in device_map.values()) or "disk" in device_map
             ):
@@ -4309,12 +4351,13 @@ class PreTrainedModel(
 
         if gguf_file:
             from .modeling_gguf_pytorch_utils import load_gguf_checkpoint
-            from .quantizers.quantizer_gguf import GGUFQuantizer
 
             gguf_parsed = load_gguf_checkpoint(checkpoint_files[0], return_tensors=True)
-            state_dict = gguf_parsed["tensors"]  # {gguf_name: GGUFQuantizedTensor} (raw bytes + quant_type)
-            # GGUFQuantizer takes precedence for materialization & weight-conversion injection.
-            hf_quantizer = GGUFQuantizer(weight_mapping=gguf_parsed.get("weight_mapping", []))
+            state_dict = gguf_parsed["tensors"]
+            set_weight_mapping = getattr(hf_quantizer, "set_weight_mapping", None)
+            if set_weight_mapping is None:
+                raise RuntimeError("GGUF loading did not initialize the registered GGUF quantizer lifecycle.")
+            set_weight_mapping(gguf_parsed.get("weight_mapping", []), state_dict)
 
         is_quantized = hf_quantizer is not None
 
@@ -4366,7 +4409,6 @@ class PreTrainedModel(
         dtype_plan = model._get_dtype_plan(dtype)
 
         # Obtain the weight conversion mapping for this model if any are registered.
-        # The quantizer (incl. GGUFQuantizer) gets the final say on how to update them.
         weight_conversions = get_model_conversion_mapping(model, key_mapping, hf_quantizer)
 
         model = cls.maybe_distribute_model(model, distributed_config, device_mesh)

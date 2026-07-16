@@ -11,20 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GGUF-specific :class:`ConversionOps` for use with :class:`WeightConverter`.
-
-The ``GGUFDequantize`` op runs first in every GGUF ``WeightConverter`` chain
-and turns each :class:`GGUFQuantizedTensor` input (raw uint8 bytes carrying
-``quant_type`` metadata) into a regular ``torch.Tensor`` — same role as
-``Fp8Dequantize`` in the FP8 quantizer's chain.
-
-The remaining ops here (``Unsqueeze``/``SubtractOne``/``LogNegate``/permute/
-reshape) operate on already-dequantized ``torch.Tensor`` objects.
-"""
+"""GGUF-specific :class:`ConversionOps` for persistent metadata and compatibility dequantization."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .core_model_loading import ConversionOps
 
@@ -80,6 +71,18 @@ class GGUFDequantize(ConversionOps):
     @property
     def reverse_op(self):
         raise NotImplementedError("GGUFDequantize is one-way")
+
+
+class GGUFSetMetadata(ConversionOps):
+    """Keep a GGUF parameter compressed while resolving its converted target key."""
+
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        target_pattern = _single_input_target(input_dict, source_patterns, target_patterns)
+        return {target_pattern: next(iter(input_dict.values()))}
+
+    @property
+    def reverse_op(self):
+        raise NotImplementedError("GGUF metadata assignment is one-way")
 
 
 class Unsqueeze(ConversionOps):
@@ -198,7 +201,7 @@ class ReversePermuteAttnQ(ConversionOps):
         input_dict: dict[str, torch.Tensor],
         source_patterns: list[str],
         target_patterns: list[str],
-        config=None,
+        config: Any = None,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
         num_heads = config.num_attention_heads
@@ -224,7 +227,7 @@ class ReversePermuteAttnK(ConversionOps):
         input_dict: dict[str, torch.Tensor],
         source_patterns: list[str],
         target_patterns: list[str],
-        config=None,
+        config: Any = None,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
         num_kv_heads = config.num_key_value_heads
@@ -251,7 +254,7 @@ class BloomReshapeQKVWeight(ConversionOps):
         input_dict: dict[str, torch.Tensor],
         source_patterns: list[str],
         target_patterns: list[str],
-        config=None,
+        config: Any = None,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
         import torch
@@ -281,7 +284,7 @@ class BloomReshapeQKVBias(ConversionOps):
         input_dict: dict[str, torch.Tensor],
         source_patterns: list[str],
         target_patterns: list[str],
-        config=None,
+        config: Any = None,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
         import torch
