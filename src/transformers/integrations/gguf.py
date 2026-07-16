@@ -369,6 +369,7 @@ class GGUFExperts(_GGUFComputeDtypeMixin, nn.Module):
         config, num_experts, hidden_dim, intermediate_dim, device, source_dtype, act_fn = cls._source_module_contract(
             module
         )
+        cls._validate_supported_experts_implementation(getattr(config, "_experts_implementation", None))
         return cls(
             config,
             device=device,
@@ -572,10 +573,15 @@ def replace_with_gguf_modules(model, compute_dtype=None):
     for name, module in modules:
         if not name:
             continue
-        if (name == "experts" or name.endswith(".experts")) and all(
+        if isinstance(module, GGUFExperts):
+            module._validate_supported_experts_implementation(getattr(module.config, "_experts_implementation", None))
+        elif (name == "experts" or name.endswith(".experts")) and all(
             hasattr(module, attribute) for attribute in ("config", "gate_up_proj", "down_proj")
         ):
             GGUFExperts._source_module_contract(module)
+            GGUFExperts._validate_supported_experts_implementation(
+                getattr(module.config, "_experts_implementation", None)
+            )
 
     for name, module in modules:
         if not name:

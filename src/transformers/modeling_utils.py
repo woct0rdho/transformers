@@ -1992,6 +1992,16 @@ class PreTrainedModel(
 
         return applicable_attention
 
+    def _validate_experts_implementation_module_capabilities(
+        self, requested_experts: str | None, config: PreTrainedConfig
+    ) -> None:
+        for module in self.modules():
+            if getattr(module, "config", None) is not config:
+                continue
+            validator = getattr(module, "_validate_supported_experts_implementation", None)
+            if callable(validator):
+                validator(requested_experts)
+
     def get_correct_experts_implementation(self, requested_experts: str | None) -> str:
         applicable_experts = "grouped_mm" if requested_experts is None else requested_experts
         base_experts_fns = ["eager"] + list(set(ALL_EXPERTS_FUNCTIONS.keys()) | set(ALL_FP8_EXPERTS_FUNCTIONS.keys()))
@@ -1999,6 +2009,20 @@ class PreTrainedModel(
         valid_experts_str_list[-1] = "and " + valid_experts_str_list[-1]
         valid_experts_str = ", ".join(valid_experts_str_list)
         if applicable_experts not in base_experts_fns:
+            # Specialized expert modules can use their own ExpertsInterface with implementations that do not
+            # belong in the architecture-wide registry. Accept such a name only when at least one module for this
+            # config exposes a validator and every applicable module accepts it.
+            module_validators = [
+                validator
+                for module in self.modules()
+                if getattr(module, "config", None) is self.config
+                and callable(validator := getattr(module, "_validate_supported_experts_implementation", None))
+            ]
+            if module_validators:
+                for validator in module_validators:
+                    validator(applicable_experts)
+                return applicable_experts
+
             message = (
                 f'Specified `experts_implementation="{applicable_experts}"` is not supported. The only possible arguments are '
                 f"{valid_experts_str}."
@@ -2014,6 +2038,7 @@ class PreTrainedModel(
                     raise e
                 applicable_experts = "eager"
 
+        self._validate_experts_implementation_module_capabilities(applicable_experts, self.config)
         return applicable_experts
 
     @classmethod
@@ -2199,6 +2224,19 @@ class PreTrainedModel(
             if not isinstance(experts_implementation, dict)
             else experts_implementation.get("", self.config._experts_implementation)
         )
+
+        if isinstance(experts_implementation, dict):
+            self._validate_experts_implementation_module_capabilities(requested_implementation, self.config)
+            for subconfig_key in self.config.sub_configs:
+                subconfig = getattr(self.config, subconfig_key, None)
+                if subconfig is not None:
+                    sub_implementation = experts_implementation.get(subconfig_key, subconfig._experts_implementation)
+                    self._validate_experts_implementation_module_capabilities(sub_implementation, subconfig)
+        else:
+            for module in self.modules():
+                validator = getattr(module, "_validate_supported_experts_implementation", None)
+                if callable(validator):
+                    validator(requested_implementation)
 
         # MegaMoE is locked at load time: its TP plan is baked into `base_model_tp_plan` by `update_tp_plan` (and isn't
         # re-evaluated) and `setup_megamoe_weights` mutates the expert weights into UTCCP layout on first forward.

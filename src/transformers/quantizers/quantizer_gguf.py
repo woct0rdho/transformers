@@ -140,16 +140,6 @@ class GGUFQuantizer(HfQuantizer):
 
     def _process_model_before_weight_loading(self, model, **kwargs):
         if self.persistent:
-            if self.quantization_config.architecture == "qwen3_moe" and model.config._experts_implementation not in {
-                "eager",
-                "grouped_mm",
-                "batched_mm",
-            }:
-                raise ValueError(
-                    f"GGUF experts do not support {model.config._experts_implementation!r}; "
-                    "use 'eager', 'grouped_mm', or 'batched_mm'."
-                )
-
             from ..integrations.gguf import replace_with_gguf_modules
             from ..utils import is_torch_available
 

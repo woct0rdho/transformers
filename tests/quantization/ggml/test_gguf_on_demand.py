@@ -28,6 +28,7 @@ if is_torch_available():
     from torch.nn import functional as F
 
     from transformers.integrations.gguf import (
+        ALL_GGUF_EXPERTS_FUNCTIONS,
         GGUFEmbedding,
         GGUFExperts,
         GGUFLinear,
@@ -903,9 +904,27 @@ class GGUFOnDemandTests(unittest.TestCase):
         self.assertEqual(quantizer.param_storage_bytes[gate_name], 32)
         self.assertEqual(quantizer.param_element_size(model, gate_name, experts.gate_proj), 0.25)
 
-        model.config._experts_implementation_internal = "deepgemm"
+        previous_implementation = model.config._experts_implementation
         with self.assertRaisesRegex(ValueError, "GGUF experts do not support 'deepgemm'"):
-            quantizer.preprocess_model(model, dtype=torch.float32, device_map={"": "cpu"})
+            model.set_experts_implementation("deepgemm")
+        self.assertEqual(model.config._experts_implementation, previous_implementation)
+
+        custom_implementation = "test_gguf_custom_experts"
+        ALL_GGUF_EXPERTS_FUNCTIONS[custom_implementation] = lambda *args, **kwargs: None
+        try:
+            model.set_experts_implementation(custom_implementation)
+            self.assertEqual(model.config._experts_implementation, custom_implementation)
+            model.set_experts_implementation(previous_implementation)
+        finally:
+            del ALL_GGUF_EXPERTS_FUNCTIONS[custom_implementation]
+
+        invalid_config = copy.deepcopy(config)
+        with torch.device("meta"):
+            invalid_model = Qwen3MoeForCausalLM(invalid_config)
+        invalid_model.config._experts_implementation_internal = "deepgemm"
+        with self.assertRaisesRegex(ValueError, "GGUF experts do not support 'deepgemm'"):
+            quantizer.preprocess_model(invalid_model, dtype=torch.float32, device_map={"": "cpu"})
+        self.assertNotIsInstance(invalid_model.get_submodule("model.layers.0.mlp.experts"), GGUFExperts)
 
 
 if __name__ == "__main__":
