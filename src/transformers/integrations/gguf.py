@@ -552,7 +552,11 @@ class GGUFExperts(_GGUFComputeDtypeMixin, nn.Module):
 
 
 class GGUFLinear(_GGUFComputeDtypeMixin, nn.Linear):
-    """Linear layer backed by a frozen compressed GGUF payload."""
+    """Linear layer backed by a frozen compressed GGUF payload.
+
+    Optional index permutations describe a GGUF physical row or column layout while keeping the
+    module's public inputs and outputs in the model's canonical logical layout.
+    """
 
     def __init__(
         self,
@@ -562,15 +566,39 @@ class GGUFLinear(_GGUFComputeDtypeMixin, nn.Linear):
         device=None,
         dtype=None,
         compute_dtype=None,
+        input_permutation=None,
+        input_permutation_offset=0,
+        output_permutation=None,
+        output_permutation_offset=0,
+        floating_weight=False,
     ):
         super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
         self.set_compute_dtype(compute_dtype or dtype or torch.get_default_dtype())
+        weight_dtype = dtype if floating_weight else torch.uint8
         self.weight = nn.Parameter(
-            torch.empty((out_features, in_features), dtype=torch.uint8, device=device), requires_grad=False
+            torch.empty((out_features, in_features), dtype=weight_dtype, device=device), requires_grad=False
         )
+        self.input_permutation_offset = input_permutation_offset
+        self.output_permutation_offset = output_permutation_offset
+        self.input_permutation = (
+            None if input_permutation is None else tuple(int(index) for index in input_permutation)
+        )
+        self.output_permutation = (
+            None if output_permutation is None else tuple(int(index) for index in output_permutation)
+        )
+        self._layout_permutation_cache = {}
 
     @classmethod
-    def from_linear(cls, module: nn.Linear, compute_dtype=None):
+    def from_linear(
+        cls,
+        module: nn.Linear,
+        compute_dtype=None,
+        input_permutation=None,
+        input_permutation_offset=0,
+        output_permutation=None,
+        output_permutation_offset=0,
+        floating_weight=False,
+    ):
         return cls(
             module.in_features,
             module.out_features,
@@ -578,7 +606,38 @@ class GGUFLinear(_GGUFComputeDtypeMixin, nn.Linear):
             device=module.weight.device,
             dtype=module.weight.dtype,
             compute_dtype=compute_dtype or module.weight.dtype,
+            input_permutation=input_permutation,
+            input_permutation_offset=input_permutation_offset,
+            output_permutation=output_permutation,
+            output_permutation_offset=output_permutation_offset,
+            floating_weight=floating_weight,
         )
+
+    def _permute_segment(self, input, permutation, offset, cache_key):
+        if permutation is None:
+            return input
+        device_key = (cache_key, input.device.type, input.device.index)
+        permutation_tensor = self._layout_permutation_cache.get(device_key)
+        if permutation_tensor is None:
+            permutation_tensor = torch.tensor(permutation, dtype=torch.long, device=input.device)
+            self._layout_permutation_cache[device_key] = permutation_tensor
+        size = len(permutation)
+        if input.shape[-1] < offset + size:
+            raise RuntimeError(
+                f"GGUFLinear layout permutation requires dimension {offset + size}, got {input.shape[-1]}"
+            )
+        permuted = input[..., offset : offset + size].index_select(-1, permutation_tensor)
+        pieces = []
+        if offset:
+            pieces.append(input[..., :offset])
+        pieces.append(permuted)
+        if offset + size < input.shape[-1]:
+            pieces.append(input[..., offset + size :])
+        return torch.cat(pieces, dim=-1) if len(pieces) > 1 else pieces[0]
+
+    def _apply(self, fn, recurse=True):
+        self._layout_permutation_cache.clear()
+        return super()._apply(fn, recurse=recurse)
 
     def materialize_logical_weight(
         self,
@@ -586,8 +645,11 @@ class GGUFLinear(_GGUFComputeDtypeMixin, nn.Linear):
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
     ) -> torch.Tensor:
-        """Materialize the floating matrix represented by this module's packed or floating weight.
+        """Materialize the floating weight represented by this module's public logical layout.
 
+        GGUF payloads and Qwen3.5 recurrent projections can use a physical layout that external
+        consumers must not infer from ``weight``. This method provides the matrix equivalent to
+        calling ``forward`` without a bias, including input and output layout permutations.
         Callers should keep the returned tensor scoped to one operation; packed weights remain
         frozen and are dequantized again on the next call.
         """
@@ -603,22 +665,43 @@ class GGUFLinear(_GGUFComputeDtypeMixin, nn.Linear):
             if not self.weight.is_floating_point():
                 raise RuntimeError("GGUFLinear weight has not been loaded with a packed or floating-point parameter")
             weight = self.weight.to(device=device, dtype=dtype)
+
+        if self.input_permutation is not None:
+            inverse_input_permutation = tuple(
+                torch.argsort(torch.tensor(self.input_permutation, dtype=torch.long)).tolist()
+            )
+            weight = self._permute_segment(
+                weight,
+                inverse_input_permutation,
+                self.input_permutation_offset,
+                "logical_weight_input",
+            )
+        if self.output_permutation is not None:
+            weight = self._permute_segment(
+                weight.transpose(0, 1),
+                self.output_permutation,
+                self.output_permutation_offset,
+                "logical_weight_output",
+            ).transpose(0, 1)
         return weight.contiguous()
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        input = self._permute_segment(input, self.input_permutation, self.input_permutation_offset, "input")
         if not isinstance(self.weight, GGUFQuantizedTensor):
             if not self.weight.is_floating_point():
                 raise RuntimeError("GGUFLinear weight has not been loaded with a packed or floating-point parameter")
-            return nn.Linear.forward(self, input)
-        input_dtype = input.dtype
-        compute_input = input.to(self.compute_dtype)
-        bias = self.bias.to(self.compute_dtype) if self.bias is not None else None
-        if torch.is_grad_enabled() and compute_input.requires_grad:
-            output = _GGUFLinearFunction.apply(compute_input, self.weight, bias, self.compute_dtype)
+            output = nn.Linear.forward(self, input)
         else:
-            weight = _dequantize_weight(self.weight, self.compute_dtype, input.device)
-            output = F.linear(compute_input, weight, bias)
-        return output.to(input_dtype)
+            input_dtype = input.dtype
+            compute_input = input.to(self.compute_dtype)
+            bias = self.bias.to(self.compute_dtype) if self.bias is not None else None
+            if torch.is_grad_enabled() and compute_input.requires_grad:
+                output = _GGUFLinearFunction.apply(compute_input, self.weight, bias, self.compute_dtype)
+            else:
+                weight = _dequantize_weight(self.weight, self.compute_dtype, input.device)
+                output = F.linear(compute_input, weight, bias)
+            output = output.to(input_dtype)
+        return self._permute_segment(output, self.output_permutation, self.output_permutation_offset, "output")
 
 
 class GGUFEmbedding(_GGUFComputeDtypeMixin, nn.Embedding):
@@ -640,6 +723,7 @@ class GGUFEmbedding(_GGUFComputeDtypeMixin, nn.Embedding):
         device=None,
         dtype=None,
         compute_dtype=None,
+        floating_weight=False,
     ):
         if max_norm is not None:
             raise ValueError("GGUFEmbedding does not support max_norm for frozen packed weights")
@@ -662,12 +746,13 @@ class GGUFEmbedding(_GGUFComputeDtypeMixin, nn.Embedding):
             dtype=dtype,
         )
         self.set_compute_dtype(compute_dtype or dtype or torch.get_default_dtype())
+        weight_dtype = dtype if floating_weight else torch.uint8
         self.weight = nn.Parameter(
-            torch.empty((num_embeddings, embedding_dim), dtype=torch.uint8, device=device), requires_grad=False
+            torch.empty((num_embeddings, embedding_dim), dtype=weight_dtype, device=device), requires_grad=False
         )
 
     @classmethod
-    def from_embedding(cls, module: nn.Embedding, compute_dtype=None):
+    def from_embedding(cls, module: nn.Embedding, compute_dtype=None, floating_weight=False):
         return cls(
             module.num_embeddings,
             module.embedding_dim,
@@ -679,6 +764,7 @@ class GGUFEmbedding(_GGUFComputeDtypeMixin, nn.Embedding):
             device=module.weight.device,
             dtype=module.weight.dtype,
             compute_dtype=compute_dtype or module.weight.dtype,
+            floating_weight=floating_weight,
         )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -702,12 +788,110 @@ def _is_expert_module_candidate(name: str, module: nn.Module) -> bool:
     return hasattr(module, "config") and (has_projection_provider or has_legacy_projections)
 
 
-def replace_with_gguf_modules(model, compute_dtype=None):
+def _validate_qwen35_gated_delta_net(name: str, module: nn.Module):
+    required_dimensions = (
+        "hidden_size",
+        "num_k_heads",
+        "num_v_heads",
+        "head_k_dim",
+        "head_v_dim",
+        "key_dim",
+        "value_dim",
+        "conv_dim",
+        "conv_kernel_size",
+    )
+    missing_dimensions = [attribute for attribute in required_dimensions if not hasattr(module, attribute)]
+    if missing_dimensions:
+        raise ValueError(f"Qwen3.5 GGUF recurrent module {name!r} is missing dimensions {missing_dimensions}")
+    if module.num_v_heads % module.num_k_heads:
+        raise ValueError(f"Qwen3.5 GGUF recurrent module {name!r} requires num_v_heads to be divisible by num_k_heads")
+
+    projection_shapes = {
+        "in_proj_qkv": (module.conv_dim, module.hidden_size),
+        "in_proj_z": (module.value_dim, module.hidden_size),
+        "in_proj_a": (module.num_v_heads, module.hidden_size),
+        "in_proj_b": (module.num_v_heads, module.hidden_size),
+        "out_proj": (module.hidden_size, module.value_dim),
+    }
+    for projection_name, expected_shape in projection_shapes.items():
+        projection = getattr(module, projection_name, None)
+        if not isinstance(projection, nn.Linear) or tuple(projection.weight.shape) != expected_shape:
+            actual_shape = tuple(projection.weight.shape) if isinstance(projection, nn.Linear) else None
+            raise ValueError(
+                f"Qwen3.5 GGUF recurrent projection {name}.{projection_name} has shape {actual_shape}, "
+                f"expected {expected_shape}"
+            )
+        if projection.bias is not None:
+            raise ValueError(f"Qwen3.5 GGUF recurrent projection {name}.{projection_name} must not have a bias")
+
+    conv = getattr(module, "conv1d", None)
+    expected_conv_shape = (module.conv_dim, 1, module.conv_kernel_size)
+    if (
+        not isinstance(conv, nn.Conv1d)
+        or tuple(conv.weight.shape) != expected_conv_shape
+        or conv.groups != module.conv_dim
+        or conv.bias is not None
+    ):
+        raise ValueError(
+            f"Qwen3.5 GGUF recurrent convolution {name}.conv1d must be bias-free depthwise convolution "
+            f"with shape {expected_conv_shape}"
+        )
+    for parameter_name, expected_shape in (
+        ("A_log", (module.num_v_heads,)),
+        ("dt_bias", (module.num_v_heads,)),
+    ):
+        parameter = getattr(module, parameter_name, None)
+        if not isinstance(parameter, torch.Tensor) or tuple(parameter.shape) != expected_shape:
+            raise ValueError(
+                f"Qwen3.5 GGUF recurrent parameter {name}.{parameter_name} must have shape {expected_shape}"
+            )
+    norm = getattr(module, "norm", None)
+    if not isinstance(getattr(norm, "weight", None), torch.Tensor) or tuple(norm.weight.shape) != (module.head_v_dim,):
+        raise ValueError(f"Qwen3.5 GGUF recurrent norm {name}.norm must have weight shape {(module.head_v_dim,)}")
+
+
+def _qwen35_value_head_orders(module: nn.Module, head_dim: int):
+    value_heads_per_key = module.num_v_heads // module.num_k_heads
+    physical_order = (
+        torch.arange(module.num_v_heads * head_dim, device="cpu")
+        .reshape(module.num_k_heads, value_heads_per_key, head_dim)
+        .transpose(0, 1)
+        .reshape(-1)
+    )
+    return physical_order, torch.argsort(physical_order)
+
+
+def _qwen35_linear_layout(model: nn.Module, name: str):
+    if getattr(model.config, "model_type", None) != "qwen3_5_text" or ".linear_attn." not in name:
+        return {}
+    parent_name, _, projection_name = name.rpartition(".")
+    module = model.get_submodule(parent_name)
+    if projection_name == "out_proj":
+        physical_order, _ = _qwen35_value_head_orders(module, module.head_v_dim)
+        return {"input_permutation": physical_order}
+    if projection_name in ("in_proj_qkv", "in_proj_z"):
+        _, canonical_order = _qwen35_value_head_orders(module, module.head_v_dim)
+        return {
+            "output_permutation": canonical_order,
+            "output_permutation_offset": 2 * module.key_dim if projection_name == "in_proj_qkv" else 0,
+        }
+    if projection_name in ("in_proj_a", "in_proj_b"):
+        _, canonical_order = _qwen35_value_head_orders(module, 1)
+        return {"output_permutation": canonical_order}
+    return {}
+
+
+def replace_with_gguf_modules(model, compute_dtype=None, floating_checkpoint_params=None):
     """Replace linear, embedding, and structurally compatible routed-expert modules on the meta model."""
+    floating_checkpoint_params = set(floating_checkpoint_params or ())
     modules = list(model.named_modules())
     for name, module in modules:
         if not name:
             continue
+        if getattr(getattr(model, "config", None), "model_type", None) == "qwen3_5_text" and name.endswith(
+            ".linear_attn"
+        ):
+            _validate_qwen35_gated_delta_net(name, module)
         if isinstance(module, GGUFExperts):
             module._validate_supported_experts_implementation(getattr(module.config, "_experts_implementation", None))
         elif _is_expert_module_candidate(name, module):
@@ -724,9 +908,18 @@ def replace_with_gguf_modules(model, compute_dtype=None):
         if _is_expert_module_candidate(name, module):
             replacement = GGUFExperts.from_module(module, compute_dtype=compute_dtype)
         elif isinstance(module, nn.Linear):
-            replacement = GGUFLinear.from_linear(module, compute_dtype=compute_dtype)
+            replacement = GGUFLinear.from_linear(
+                module,
+                compute_dtype=compute_dtype,
+                floating_weight=f"{name}.weight" in floating_checkpoint_params,
+                **_qwen35_linear_layout(model, name),
+            )
         elif isinstance(module, nn.Embedding):
-            replacement = GGUFEmbedding.from_embedding(module, compute_dtype=compute_dtype)
+            replacement = GGUFEmbedding.from_embedding(
+                module,
+                compute_dtype=compute_dtype,
+                floating_weight=f"{name}.weight" in floating_checkpoint_params,
+            )
         else:
             continue
         parent_name, _, child_name = name.rpartition(".")

@@ -161,12 +161,6 @@ class GGUFOnDemandTests(unittest.TestCase):
         module.weight = compressed
         inputs = torch.randn(2, 3, 4, requires_grad=True)
         torch.testing.assert_close(module(inputs), F.linear(inputs, full_weight))
-        torch.testing.assert_close(module.materialize_logical_weight(), full_weight)
-        logical_bf16 = module.materialize_logical_weight(dtype=torch.bfloat16, device="cpu")
-        self.assertEqual(logical_bf16.dtype, torch.bfloat16)
-        torch.testing.assert_close(logical_bf16, full_weight.to(torch.bfloat16))
-        with self.assertRaisesRegex(TypeError, "floating-point dtype"):
-            module.materialize_logical_weight(dtype=torch.int32)
         module(inputs).sum().backward()
         self.assertIsNotNone(inputs.grad)
         self.assertIn("weight", dict(module.named_parameters()))
@@ -220,6 +214,70 @@ class GGUFOnDemandTests(unittest.TestCase):
         assert linear.bias is not None and linear.bias.grad is not None and reference_bias.grad is not None
         torch.testing.assert_close(linear.bias.grad, reference_bias.grad)
         self.assertIsNone(linear.weight.grad)
+
+    def test_linear_layout_permutations_preserve_outputs_and_input_gradients(self):
+        torch.manual_seed(0)
+        num_key_heads = 2
+        value_heads_per_key = 3
+        head_dim = 2
+        value_size = num_key_heads * value_heads_per_key * head_dim
+        physical_order = (
+            torch.arange(value_size).reshape(num_key_heads, value_heads_per_key, head_dim).transpose(0, 1).reshape(-1)
+        )
+        canonical_order = torch.argsort(physical_order)
+
+        canonical_output_weight = torch.randn(value_size, 5)
+        physical_output_weight = canonical_output_weight.index_select(0, physical_order)
+        output_linear = GGUFLinear(
+            5,
+            value_size,
+            bias=False,
+            compute_dtype=torch.float32,
+            output_permutation=canonical_order,
+        )
+        output_linear.weight = GGUFQuantizedTensor(
+            torch.from_numpy(_float_bytes(physical_output_weight)),
+            quant_type=gguf.GGMLQuantizationType.F32,
+            logical_shape=physical_output_weight.shape,
+        )
+
+        canonical_input_weight = torch.randn(7, value_size)
+        physical_input_weight = canonical_input_weight.index_select(1, physical_order)
+        input_linear = GGUFLinear(
+            value_size,
+            7,
+            bias=False,
+            compute_dtype=torch.float32,
+            input_permutation=physical_order,
+        )
+        input_linear.weight = torch.nn.Parameter(physical_input_weight, requires_grad=False)
+
+        inputs = torch.randn(2, 3, 5, requires_grad=True)
+        reference_inputs = inputs.detach().clone().requires_grad_(True)
+        actual = input_linear(output_linear(inputs))
+        expected = F.linear(F.linear(reference_inputs, canonical_output_weight), canonical_input_weight)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(output_linear.materialize_logical_weight(), canonical_output_weight)
+        torch.testing.assert_close(input_linear.materialize_logical_weight(), canonical_input_weight)
+        logical_bf16 = output_linear.materialize_logical_weight(dtype=torch.bfloat16, device="cpu")
+        self.assertEqual(logical_bf16.dtype, torch.bfloat16)
+        torch.testing.assert_close(logical_bf16, canonical_output_weight.to(torch.bfloat16))
+        with self.assertRaisesRegex(TypeError, "floating-point dtype"):
+            output_linear.materialize_logical_weight(dtype=torch.int32)
+
+        materialized = F.linear(
+            F.linear(inputs.detach(), output_linear.materialize_logical_weight()),
+            input_linear.materialize_logical_weight(),
+        )
+        torch.testing.assert_close(materialized, actual.detach())
+
+        grad_output = torch.randn_like(actual)
+        actual.backward(grad_output)
+        expected.backward(grad_output)
+        assert inputs.grad is not None and reference_inputs.grad is not None
+        torch.testing.assert_close(inputs.grad, reference_inputs.grad)
+        self.assertIsNone(output_linear.weight.grad)
+        self.assertIsNone(input_linear.weight.grad)
 
     def test_unloaded_gguf_modules_fail_before_checkpoint_assignment(self):
         linear = GGUFLinear(4, 3, bias=False)
@@ -592,9 +650,6 @@ class GGUFOnDemandTests(unittest.TestCase):
         actual = linear(inputs)
         self.assertEqual(actual.dtype, torch.float32)
         torch.testing.assert_close(actual, F.linear(inputs, full_weight, bias))
-        torch.testing.assert_close(
-            linear.materialize_logical_weight(dtype=torch.float64), full_weight.to(torch.float64)
-        )
 
         embedding = GGUFEmbedding(3, 4, compute_dtype=torch.float64)
         embedding.weight = torch.nn.Parameter(full_weight.clone())
