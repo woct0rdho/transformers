@@ -41,7 +41,12 @@ class GGUFQuantizer(HfQuantizer):
             quantization_config = GGUFConfig()
         kwargs.setdefault("pre_quantized", True)
         super().__init__(quantization_config=quantization_config, **kwargs)
-        self.persistent = quantization_config.architecture in {"qwen3", "qwen3_moe", "qwen3_5_text"}
+        self.persistent = quantization_config.architecture in {
+            "qwen3",
+            "qwen3_moe",
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+        }
         self.compute_dtype = None
         self.weight_mapping = list(weight_mapping or [])
         self.checkpoint_storage_bytes = {}
@@ -55,7 +60,7 @@ class GGUFQuantizer(HfQuantizer):
     def validate_environment(self, *args, **kwargs):
         if self.quantization_config.architecture and not self.persistent:
             logger.warning_once(
-                f"Persistent GGUF weights currently support Qwen3, Qwen3-MoE, and dense Qwen3.5 text models; "
+                f"Persistent GGUF weights currently support Qwen3, Qwen3-MoE, and Qwen3.5 text models; "
                 f"{self.quantization_config.architecture!r} will use load-time dequantization."
             )
 

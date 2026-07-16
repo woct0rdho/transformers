@@ -861,8 +861,11 @@ def _qwen35_value_head_orders(module: nn.Module, head_dim: int):
     return physical_order, torch.argsort(physical_order)
 
 
+_QWEN35_TEXT_MODEL_TYPES = {"qwen3_5_text", "qwen3_5_moe_text"}
+
+
 def _qwen35_linear_layout(model: nn.Module, name: str):
-    if getattr(model.config, "model_type", None) != "qwen3_5_text" or ".linear_attn." not in name:
+    if getattr(model.config, "model_type", None) not in _QWEN35_TEXT_MODEL_TYPES or ".linear_attn." not in name:
         return {}
     parent_name, _, projection_name = name.rpartition(".")
     module = model.get_submodule(parent_name)
@@ -888,7 +891,7 @@ def replace_with_gguf_modules(model, compute_dtype=None, floating_checkpoint_par
     for name, module in modules:
         if not name:
             continue
-        if getattr(getattr(model, "config", None), "model_type", None) == "qwen3_5_text" and name.endswith(
+        if getattr(getattr(model, "config", None), "model_type", None) in _QWEN35_TEXT_MODEL_TYPES and name.endswith(
             ".linear_attn"
         ):
             _validate_qwen35_gated_delta_net(name, module)

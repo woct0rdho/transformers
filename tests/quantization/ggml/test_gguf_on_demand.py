@@ -43,6 +43,7 @@ if is_torch_available():
     from transformers.integrations.moe import use_experts_implementation
     from transformers.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
     from transformers.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+    from transformers.models.qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextConfig
     from transformers.models.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM
     from transformers.quantizers.quantizer_gguf import GGUFQuantizer
 
@@ -972,6 +973,196 @@ class GGUFOnDemandTests(unittest.TestCase):
         torch.testing.assert_close(step.logits[:, -1], expected_logits[:, 2], rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(final_step.logits[:, -1], expected_logits[:, 3], rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(chunk.logits, expected_logits[:, 1:], rtol=1e-5, atol=1e-6)
+
+        generated = model.generate(input_ids, max_new_tokens=2, do_sample=False)
+        self.assertEqual(generated.shape, (1, input_ids.shape[1] + 2))
+
+        model.gradient_checkpointing_enable()
+        model.train()
+        input_embeds = torch.randn(1, 3, config.hidden_size, requires_grad=True)
+        model(inputs_embeds=input_embeds, use_cache=False).logits.float().square().mean().backward()
+        self.assertIsNotNone(input_embeds.grad)
+        self.assertTrue(torch.isfinite(input_embeds.grad).all())
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for parameter in model.parameters()
+                if isinstance(parameter, GGUFQuantizedTensor)
+            )
+        )
+
+    @unittest.skipIf(
+        is_causal_conv1d_available() or is_flash_linear_attention_available(),
+        "CPU fallback test requires the optional accelerator implementations to be unavailable",
+    )
+    def test_tiny_qwen35_moe_forward_generation_and_persistent_replacement(self):
+        torch.manual_seed(0)
+        config = Qwen3_5MoeTextConfig(
+            vocab_size=32,
+            hidden_size=24,
+            num_hidden_layers=2,
+            num_attention_heads=3,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=32,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=2,
+            linear_num_value_heads=6,
+            moe_intermediate_size=8,
+            shared_expert_intermediate_size=12,
+            num_experts=4,
+            num_experts_per_tok=2,
+            layer_types=["linear_attention", "full_attention"],
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 10000.0,
+                "partial_rotary_factor": 0.5,
+                "mrope_section": [1, 1, 0],
+                "mrope_interleaved": True,
+            },
+            tie_word_embeddings=False,
+            bos_token_id=0,
+            eos_token_id=1,
+            pad_token_id=0,
+        )
+        model = Qwen3_5MoeForCausalLM(config).eval()
+        input_ids = torch.tensor([[2, 5, 7, 3]])
+        router_inputs = torch.randn(3, config.hidden_size)
+        with torch.no_grad():
+            expected_logits = model(input_ids).logits
+            expected_router = model.model.layers[0].mlp.gate(router_inputs)
+
+        source_weights = {
+            f"{name}.weight": module.weight.detach().clone()
+            for name, module in model.named_modules()
+            if isinstance(module, (torch.nn.Linear, torch.nn.Embedding))
+        }
+        source_experts = {
+            name: {
+                "gate_up_proj": module.gate_up_proj.detach().clone(),
+                "down_proj": module.down_proj.detach().clone(),
+            }
+            for name, module in model.named_modules()
+            if name.endswith(".mlp.experts")
+        }
+
+        from transformers.core_model_loading import WeightRenaming
+        from transformers.modeling_gguf_pytorch_utils import get_gguf_converters
+
+        weight_mapping = get_gguf_converters("qwen3_5_moe_text")
+        quantizer = GGUFQuantizer(
+            GGUFConfig(architecture="qwen3_5_moe_text"),
+            weight_mapping=weight_mapping,
+        )
+        quantizer.set_weight_mapping(
+            weight_mapping,
+            {
+                "blk.0.ffn_gate_inp.weight": torch.empty(4, 24, dtype=torch.float32),
+                "blk.0.ffn_gate_inp_shexp.weight": torch.empty(24, dtype=torch.float32),
+                "blk.1.ffn_gate_inp.weight": torch.empty(4, 24, dtype=torch.float32),
+                "blk.1.ffn_gate_inp_shexp.weight": torch.empty(24, dtype=torch.float32),
+            },
+        )
+        quantizer.update_dtype(torch.float32)
+        conversions = quantizer.update_weight_conversions([])
+        renamings = {
+            source: conversion.target_patterns[0]
+            for conversion in conversions
+            if isinstance(conversion, WeightRenaming)
+            for source in conversion.source_patterns
+        }
+        self.assertEqual(renamings[r"\.ffn_gate_exps\.weight"], ".mlp.experts.gate_proj")
+        self.assertEqual(renamings[r"\.ffn_up_exps\.weight"], ".mlp.experts.up_proj")
+        quantizer.preprocess_model(model, dtype=torch.float32, device_map={"": "cpu"})
+
+        linear_attn = model.model.layers[0].linear_attn
+        self.assertIsInstance(model.model.layers[0].mlp.experts, GGUFExperts)
+        self.assertIsInstance(model.model.layers[1].mlp.experts, GGUFExperts)
+        self.assertEqual(linear_attn.in_proj_a.weight.dtype, torch.uint8)
+        self.assertEqual(linear_attn.in_proj_b.weight.dtype, torch.uint8)
+        self.assertEqual(model.model.layers[0].mlp.shared_expert_gate.weight.dtype, torch.float32)
+        value_heads_per_key = linear_attn.num_v_heads // linear_attn.num_k_heads
+
+        def physical_order(head_dim):
+            return (
+                torch.arange(linear_attn.num_v_heads * head_dim)
+                .reshape(linear_attn.num_k_heads, value_heads_per_key, head_dim)
+                .transpose(0, 1)
+                .reshape(-1)
+            )
+
+        for name, module in model.named_modules():
+            if isinstance(module, GGUFExperts):
+                gate, up = source_experts[name]["gate_up_proj"].chunk(2, dim=1)
+                for projection_name, full_weight in (
+                    ("gate_proj", gate),
+                    ("up_proj", up),
+                    ("down_proj", source_experts[name]["down_proj"]),
+                ):
+                    setattr(
+                        module,
+                        projection_name,
+                        GGUFQuantizedTensor(
+                            torch.from_numpy(_float_bytes(full_weight)),
+                            quant_type=gguf.GGMLQuantizationType.F32,
+                            logical_shape=full_weight.shape,
+                        ),
+                    )
+                continue
+            if not isinstance(module, (GGUFLinear, GGUFEmbedding)):
+                continue
+
+            full_weight = source_weights[f"{name}.weight"]
+            physical_weight = full_weight.clone()
+            if name.endswith("linear_attn.in_proj_qkv"):
+                value_offset = 2 * linear_attn.key_dim
+                physical_weight[value_offset:] = full_weight[value_offset:].index_select(
+                    0, physical_order(linear_attn.head_v_dim)
+                )
+            elif name.endswith(("linear_attn.in_proj_z", "linear_attn.in_proj_a", "linear_attn.in_proj_b")):
+                head_dim = 1 if name.endswith(("in_proj_a", "in_proj_b")) else linear_attn.head_v_dim
+                physical_weight = full_weight.index_select(0, physical_order(head_dim))
+            elif name.endswith("linear_attn.out_proj"):
+                physical_weight = full_weight.index_select(1, physical_order(linear_attn.head_v_dim))
+
+            if name.endswith("mlp.shared_expert_gate"):
+                module.weight = torch.nn.Parameter(physical_weight, requires_grad=False)
+            else:
+                module.weight = GGUFQuantizedTensor(
+                    torch.from_numpy(_float_bytes(physical_weight)),
+                    quant_type=gguf.GGMLQuantizationType.F32,
+                    logical_shape=physical_weight.shape,
+                )
+
+        with torch.no_grad():
+            actual_router = model.model.layers[0].mlp.gate(router_inputs)
+            actual_logits = model(input_ids).logits
+            prefill = model(input_ids[:, :2], use_cache=True)
+            step = model(input_ids[:, 2:3], past_key_values=prefill.past_key_values, use_cache=True)
+            final_step = model(input_ids[:, 3:], past_key_values=step.past_key_values, use_cache=True)
+            chunk_prefill = model(input_ids[:, :1], use_cache=True)
+            chunk = model(input_ids[:, 1:], past_key_values=chunk_prefill.past_key_values, use_cache=True)
+        for actual, expected in zip(actual_router, expected_router):
+            torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_logits, expected_logits, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(step.logits[:, -1], expected_logits[:, 2], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(final_step.logits[:, -1], expected_logits[:, 3], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(chunk.logits, expected_logits[:, 1:], rtol=1e-5, atol=1e-6)
+
+        for implementation in ("grouped_mm", "batched_mm"):
+            with self.subTest(implementation=implementation):
+                model.set_experts_implementation(implementation)
+                with torch.no_grad():
+                    backend_logits = model(input_ids).logits
+                torch.testing.assert_close(backend_logits, actual_logits, rtol=1e-5, atol=1e-6)
+        model.set_experts_implementation("eager")
+
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+            autocast_logits = model(input_ids).logits
+        self.assertTrue(torch.isfinite(autocast_logits).all())
+        torch.testing.assert_close(autocast_logits.float(), actual_logits, rtol=5e-2, atol=5e-2)
 
         generated = model.generate(input_ids, max_new_tokens=2, do_sample=False)
         self.assertEqual(generated.shape, (1, input_ids.shape[1] + 2))
