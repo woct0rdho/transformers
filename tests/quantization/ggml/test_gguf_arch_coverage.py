@@ -17,11 +17,17 @@ from __future__ import annotations
 
 import re
 import unittest
+from types import SimpleNamespace
 
 from parameterized import parameterized
 
-from transformers.core_model_loading import WeightConverter, WeightRenaming
-from transformers.modeling_gguf_pytorch_utils import _GGUF_ARCH_CONVERTERS, get_gguf_converters
+from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
+from transformers.gguf_conversion_ops import Qwen3_5ReorderValueHeads
+from transformers.modeling_gguf_pytorch_utils import (
+    _GGUF_ARCH_CONVERTERS,
+    _postprocess_qwen35_config,
+    get_gguf_converters,
+)
 from transformers.quantizers.quantizer_gguf import GGUFQuantizer
 
 
@@ -36,6 +42,7 @@ EXPECTED_MODEL_TYPES = sorted(
         "cohere",
         "qwen2",
         "qwen3",
+        "qwen3_5_text",
         "deci",
         "stablelm",
         "starcoder2",
@@ -87,7 +94,7 @@ class GgufArchCoverageTests(unittest.TestCase):
         """Qwen GGUF files retain Hugging Face's split-half Q/K layout for NeoX RoPE."""
         from transformers.gguf_conversion_ops import ReversePermuteAttnK, ReversePermuteAttnQ
 
-        for model_type in ("qwen2", "qwen3", "qwen2_moe", "qwen3_moe"):
+        for model_type in ("qwen2", "qwen3", "qwen3_5_text", "qwen2_moe", "qwen3_moe"):
             rules = get_gguf_converters(model_type)
             source_patterns = [source for rule in rules for source in rule.source_patterns]
             self.assertTrue(any(re.search(source, "model.layers.0.attn_q.weight") for source in source_patterns))
@@ -107,6 +114,119 @@ class GgufArchCoverageTests(unittest.TestCase):
                 if isinstance(rule, WeightRenaming):
                     key, _ = rule.rename_source_key(key)
             self.assertEqual(key, f"model.layers.0.self_attn.{projection}_norm.weight")
+
+    def test_qwen35_config_reconstruction(self):
+        config = {
+            "model_type": "qwen3_5_text",
+            "max_position_embeddings": 262144,
+            "num_hidden_layers": 8,
+            "intermediate_size": 9216,
+            "hidden_size": 2560,
+            "head_dim": 256,
+            "_gguf_attention_value_length": 256,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "rms_norm_eps": 1e-6,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 6,
+            "_gguf_linear_inner_size": 768,
+            "_gguf_rope_dimension_count": 64,
+            "_gguf_rope_dimension_sections": [11, 11, 10, 0],
+            "_gguf_rope_theta": 10_000_000.0,
+            "_gguf_full_attention_interval": 4,
+        }
+        _postprocess_qwen35_config(config)
+        self.assertEqual(config["linear_value_head_dim"], 128)
+        self.assertEqual(
+            config["layer_types"],
+            [
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ],
+        )
+        self.assertEqual(
+            config["rope_parameters"],
+            {
+                "rope_type": "default",
+                "rope_theta": 10_000_000.0,
+                "partial_rotary_factor": 0.25,
+                "mrope_section": [11, 11, 10],
+                "mrope_interleaved": True,
+            },
+        )
+        self.assertFalse(any(key.startswith("_gguf_") for key in config))
+
+    def test_qwen35_explicit_recurrent_layers_override_interval(self):
+        config = {
+            "num_hidden_layers": 4,
+            "head_dim": 8,
+            "_gguf_attention_value_length": 8,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "_gguf_linear_inner_size": 16,
+            "_gguf_rope_dimension_count": 4,
+            "_gguf_rope_dimension_sections": [1, 1, 0, 0],
+            "_gguf_rope_theta": 10000.0,
+            "_gguf_recurrent_layers": [True, False, True, False],
+            "_gguf_full_attention_interval": 3,
+        }
+        _postprocess_qwen35_config(config)
+        self.assertEqual(
+            config["layer_types"],
+            ["linear_attention", "full_attention", "linear_attention", "full_attention"],
+        )
+
+    def test_qwen35_converter_names_and_value_head_reorder(self):
+        import torch
+
+        rules = get_gguf_converters("qwen3_5_text")
+        renamings = [rule for rule in rules if isinstance(rule, WeightRenaming)]
+        converters = [rule for rule in rules if isinstance(rule, WeightConverter)]
+        expected_names = {
+            "blk.0.attn_qkv.weight": "model.layers.0.linear_attn.in_proj_qkv.weight",
+            "blk.0.attn_gate.weight": "model.layers.0.linear_attn.in_proj_z.weight",
+            "blk.0.ssm_alpha.weight": "model.layers.0.linear_attn.in_proj_a.weight",
+            "blk.0.ssm_beta.weight": "model.layers.0.linear_attn.in_proj_b.weight",
+            "blk.0.ssm_a": "model.layers.0.linear_attn.A_log",
+            "blk.0.ssm_dt.bias": "model.layers.0.linear_attn.dt_bias",
+            "blk.0.ssm_conv1d.weight": "model.layers.0.linear_attn.conv1d.weight",
+            "blk.0.ssm_norm.weight": "model.layers.0.linear_attn.norm.weight",
+            "blk.0.ssm_out.weight": "model.layers.0.linear_attn.out_proj.weight",
+            "blk.3.attn_q.weight": "model.layers.3.self_attn.q_proj.weight",
+            "blk.3.attn_q_norm.weight": "model.layers.3.self_attn.q_norm.weight",
+            "blk.3.post_attention_norm.weight": "model.layers.3.post_attention_layernorm.weight",
+        }
+        for source, expected in expected_names.items():
+            actual, _ = rename_source_key(source, renamings, converters)
+            self.assertEqual(actual, expected)
+
+        config = SimpleNamespace(
+            linear_num_key_heads=2,
+            linear_num_value_heads=6,
+            linear_key_head_dim=3,
+            linear_value_head_dim=2,
+        )
+        physical_order = torch.arange(12).reshape(2, 3, 2).transpose(0, 1).reshape(-1)
+        canonical = torch.arange(12, dtype=torch.float32)
+        physical = canonical.index_select(0, physical_order)
+        op = Qwen3_5ReorderValueHeads(head_dim=2)
+        actual = op.convert({"source": physical}, ["source"], ["target"], config=config)["target"]
+        torch.testing.assert_close(actual, canonical)
+
+        canonical_conv = torch.arange(24 * 4, dtype=torch.float32).reshape(24, 4)
+        physical_conv = canonical_conv.clone()
+        physical_conv[12:] = canonical_conv[12:].index_select(0, physical_order)
+        conv_op = Qwen3_5ReorderValueHeads(head_dim=None, value_offset="qkv")
+        actual_conv = conv_op.convert({"source": physical_conv}, ["source"], ["target"], config=config)["target"]
+        torch.testing.assert_close(actual_conv, canonical_conv)
 
     def test_quantizer_prepends_gguf_dequantize_to_every_converter(self):
         """``GGUFQuantizer.update_weight_conversions`` injects ``GGUFDequantize`` at the head

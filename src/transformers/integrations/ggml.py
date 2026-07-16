@@ -144,6 +144,29 @@ GGUF_CONFIG_MAPPING = {
         "expert_count": "num_experts",
         "expert_used_count": "num_experts_per_tok",
     },
+    "qwen3_5_text": {
+        "context_length": "max_position_embeddings",
+        "block_count": "num_hidden_layers",
+        "feed_forward_length": "intermediate_size",
+        "embedding_length": "hidden_size",
+        "rope.dimension_count": "_gguf_rope_dimension_count",
+        "rope.dimension_sections": "_gguf_rope_dimension_sections",
+        "rope.freq_base": "_gguf_rope_theta",
+        "attention.key_length": "head_dim",
+        "attention.value_length": "_gguf_attention_value_length",
+        "attention.head_count": "num_attention_heads",
+        "attention.head_count_kv": "num_key_value_heads",
+        "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+        "attention.recurrent_layers": "_gguf_recurrent_layers",
+        "full_attention_interval": "_gguf_full_attention_interval",
+        "ssm.conv_kernel": "linear_conv_kernel_dim",
+        "ssm.state_size": "linear_key_head_dim",
+        "ssm.group_count": "linear_num_key_heads",
+        "ssm.time_step_rank": "linear_num_value_heads",
+        "ssm.inner_size": "_gguf_linear_inner_size",
+        "nextn_predict_layers": "_gguf_nextn_predict_layers",
+        "vocab_size": "vocab_size",
+    },
     "falcon": {
         "context_length": "max_position_embeddings",
         "block_count": "num_hidden_layers",
@@ -364,6 +387,12 @@ GGUF_TOKENIZER_MAPPING = {
 
 # We only need to set here the parameters that default to different values between transformers and llamacpp.
 GGUF_CONFIG_DEFAULTS_MAPPING = {
+    "qwen3_5_text": {
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "attn_output_gate": True,
+        "hidden_act": "silu",
+    },
     "qwen3_moe": {
         # NOTE: Qwen3MoeConfig defaults to false but llama.cpp needs this to be true.
         # See: https://github.com/ggml-org/llama.cpp/blob/17f7f4baad8b3a716ee139da7bb56ae984e8c0fa/src/models/qwen3moe.cpp#L85-L96

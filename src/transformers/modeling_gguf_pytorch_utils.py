@@ -56,6 +56,7 @@ if is_torch_available():
         BloomReshapeQKVBias,
         BloomReshapeQKVWeight,
         LogNegate,
+        Qwen3_5ReorderValueHeads,
         ReversePermuteAttnK,
         ReversePermuteAttnQ,
         SubtractOne,
@@ -117,6 +118,63 @@ if is_torch_available():
     )
     _QWEN3_CONVERTERS = _QWEN_CONVERTERS + [
         WeightRenaming(r"\.attn_(q|k)_norm\.weight", r".self_attn.\1_norm.weight"),
+    ]
+    _QWEN35_CONVERTERS = [
+        _BLK_PREFIX,
+        WeightRenaming(r"^token_embd\.weight", "model.embed_tokens.weight"),
+        WeightConverter(
+            source_patterns=r"^output_norm\.weight",
+            target_patterns="model.norm.weight",
+            operations=[SubtractOne()],
+        ),
+        WeightRenaming(r"^output\.weight", "lm_head.weight"),
+        WeightConverter(
+            source_patterns=r"\.attn_norm\.weight",
+            target_patterns=".input_layernorm.weight",
+            operations=[SubtractOne()],
+        ),
+        WeightConverter(
+            source_patterns=r"\.post_attention_norm\.weight",
+            target_patterns=".post_attention_layernorm.weight",
+            operations=[SubtractOne()],
+        ),
+        WeightRenaming(r"\.ffn_(gate|up|down)\.weight", r".mlp.\1_proj.weight"),
+        WeightRenaming(r"\.attn_(q|k|v)\.weight", r".self_attn.\1_proj.weight"),
+        WeightRenaming(r"\.attn_output\.weight", ".self_attn.o_proj.weight"),
+        WeightConverter(
+            source_patterns=r"\.attn_q_norm\.weight",
+            target_patterns=".self_attn.q_norm.weight",
+            operations=[SubtractOne()],
+        ),
+        WeightConverter(
+            source_patterns=r"\.attn_k_norm\.weight",
+            target_patterns=".self_attn.k_norm.weight",
+            operations=[SubtractOne()],
+        ),
+        WeightRenaming(r"\.attn_qkv\.weight", ".linear_attn.in_proj_qkv.weight"),
+        WeightRenaming(r"\.attn_gate\.weight", ".linear_attn.in_proj_z.weight"),
+        WeightRenaming(r"\.ssm_alpha\.weight", ".linear_attn.in_proj_a.weight"),
+        WeightRenaming(r"\.ssm_beta\.weight", ".linear_attn.in_proj_b.weight"),
+        WeightRenaming(r"\.ssm_norm\.weight", ".linear_attn.norm.weight"),
+        WeightRenaming(r"\.ssm_out\.weight", ".linear_attn.out_proj.weight"),
+        WeightConverter(
+            source_patterns=r"\.ssm_a$",
+            target_patterns=".linear_attn.A_log",
+            operations=[Qwen3_5ReorderValueHeads(), LogNegate()],
+        ),
+        WeightConverter(
+            source_patterns=r"\.ssm_dt\.bias",
+            target_patterns=".linear_attn.dt_bias",
+            operations=[Qwen3_5ReorderValueHeads()],
+        ),
+        WeightConverter(
+            source_patterns=r"\.ssm_conv1d\.weight",
+            target_patterns=".linear_attn.conv1d.weight",
+            operations=[
+                Qwen3_5ReorderValueHeads(head_dim=None, value_offset="qkv"),
+                Unsqueeze(1),
+            ],
+        ),
     ]
     _NEMOTRON_CONVERTERS = _LLAMA_SHARED_RENAMES + _NORM_SUBTRACT_ONE_CONVERTERS + _ROPE_ATTN_CONVERTERS
 
@@ -392,6 +450,7 @@ if is_torch_available():
         "cohere": _LLAMA_CONVERTERS,
         "qwen2": _QWEN_CONVERTERS,
         "qwen3": _QWEN3_CONVERTERS,
+        "qwen3_5_text": _QWEN35_CONVERTERS,
         "deci": _LLAMA_CONVERTERS,
         # Norm-subtract-one variants
         "nemotron": _NEMOTRON_CONVERTERS,
@@ -430,6 +489,95 @@ def read_field(reader, field):
         return []
     value = reader.fields[field]
     return [_gguf_parse_value(value.parts[_data_index], value.types) for _data_index in value.data]
+
+
+def _postprocess_qwen35_config(config):
+    """Build the strict Qwen3.5 text configuration derived from GGUF metadata."""
+
+    def pop_required(key):
+        if key not in config:
+            raise ValueError(f"Qwen3.5 GGUF metadata is missing required field {key!r}")
+        return config.pop(key)
+
+    nextn_layers = int(config.pop("_gguf_nextn_predict_layers", 0))
+    if nextn_layers:
+        raise ValueError("Persistent Qwen3.5 GGUF loading does not yet support NextN/MTP layers")
+
+    head_dim = int(pop_required("head_dim"))
+    value_length = int(pop_required("_gguf_attention_value_length"))
+    if value_length != head_dim:
+        raise ValueError(
+            f"Qwen3.5 GGUF attention key and value dimensions must match, got {head_dim} and {value_length}"
+        )
+    config["head_dim"] = head_dim
+
+    linear_num_key_heads = int(pop_required("linear_num_key_heads"))
+    linear_num_value_heads = int(pop_required("linear_num_value_heads"))
+    if linear_num_value_heads % linear_num_key_heads:
+        raise ValueError(
+            "Qwen3.5 GGUF linear_num_value_heads must be divisible by linear_num_key_heads, got "
+            f"{linear_num_value_heads} and {linear_num_key_heads}"
+        )
+    config["linear_num_key_heads"] = linear_num_key_heads
+    config["linear_num_value_heads"] = linear_num_value_heads
+
+    linear_inner_size = int(pop_required("_gguf_linear_inner_size"))
+    if linear_inner_size % linear_num_value_heads:
+        raise ValueError(
+            f"Qwen3.5 GGUF SSM inner size {linear_inner_size} must be divisible by "
+            f"the value-head count {linear_num_value_heads}"
+        )
+    config["linear_value_head_dim"] = linear_inner_size // linear_num_value_heads
+
+    rope_dimension_count = int(pop_required("_gguf_rope_dimension_count"))
+    if not 0 < rope_dimension_count <= head_dim:
+        raise ValueError(
+            f"Qwen3.5 GGUF RoPE dimension count {rope_dimension_count} must be in the range (0, {head_dim}]"
+        )
+    rope_sections = list(pop_required("_gguf_rope_dimension_sections"))
+    if len(rope_sections) == 4:
+        if rope_sections[-1] != 0:
+            raise ValueError(f"Qwen3.5 GGUF M-RoPE fourth section must be zero, got {rope_sections}")
+        rope_sections = rope_sections[:3]
+    if len(rope_sections) != 3 or 2 * sum(rope_sections) != rope_dimension_count:
+        raise ValueError(
+            f"Qwen3.5 GGUF M-RoPE sections {rope_sections} must contain three entries whose doubled sum "
+            f"equals the RoPE dimension count {rope_dimension_count}"
+        )
+    config["rope_parameters"] = {
+        "rope_type": "default",
+        "rope_theta": float(pop_required("_gguf_rope_theta")),
+        "partial_rotary_factor": rope_dimension_count / head_dim,
+        "mrope_section": rope_sections,
+        "mrope_interleaved": True,
+    }
+
+    num_hidden_layers = int(pop_required("num_hidden_layers"))
+    if num_hidden_layers <= 0:
+        raise ValueError(f"Qwen3.5 GGUF block count must be positive, got {num_hidden_layers}")
+    config["num_hidden_layers"] = num_hidden_layers
+    recurrent_layers = config.pop("_gguf_recurrent_layers", None)
+    if recurrent_layers is not None:
+        if not isinstance(recurrent_layers, list):
+            recurrent_layers = [recurrent_layers] * num_hidden_layers
+        if len(recurrent_layers) < num_hidden_layers:
+            raise ValueError(
+                f"Qwen3.5 GGUF recurrent-layer metadata has {len(recurrent_layers)} entries, "
+                f"expected at least {num_hidden_layers}"
+            )
+        config["layer_types"] = [
+            "linear_attention" if bool(is_recurrent) else "full_attention"
+            for is_recurrent in recurrent_layers[:num_hidden_layers]
+        ]
+        config.pop("_gguf_full_attention_interval", None)
+    else:
+        interval = int(config.pop("_gguf_full_attention_interval", 4))
+        if interval <= 0:
+            raise ValueError(f"Qwen3.5 GGUF full-attention interval must be positive, got {interval}")
+        config["layer_types"] = [
+            "full_attention" if (layer_idx + 1) % interval == 0 else "linear_attention"
+            for layer_idx in range(num_hidden_layers)
+        ]
 
 
 def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
@@ -487,6 +635,8 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
         updated_architecture = "qwen2_moe"
     elif "qwen3moe" in architecture:
         updated_architecture = "qwen3_moe"
+    elif architecture == "qwen35":
+        updated_architecture = "qwen3_5_text"
 
     # For stablelm architecture, we need to set qkv_bias and use_parallel_residual from tensors
     # If `qkv_bias=True`, qkv_proj with bias will be present in the tensors
@@ -545,6 +695,9 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
 
         if gguf_key in reader_keys:
             logger.info(f"Some keys were not parsed and added into account {gguf_key} | {value}")
+
+    if parsed_parameters["config"]["model_type"] == "qwen3_5_text":
+        _postprocess_qwen35_config(parsed_parameters["config"])
 
     # Gemma3 GGUF checkpoint only contains weights of text backbone
     if parsed_parameters["config"]["model_type"] == "gemma3":

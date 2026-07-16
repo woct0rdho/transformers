@@ -171,6 +171,84 @@ class AddOne(ConversionOps):
         return SubtractOne()
 
 
+class Qwen3_5ReorderValueHeads(ConversionOps):
+    """Restore canonical Qwen3.5 value-head order for small floating GGUF tensors.
+
+    llama.cpp tiles value heads by their position within each key-head group. Transformers groups
+    all value heads belonging to a key head contiguously. Large projection matrices retain the GGUF
+    layout and adapt activations at runtime; this operation is only for small state and convolution
+    tensors that are stored unquantized.
+    """
+
+    def __init__(self, dim: int = 0, head_dim: int | None = 1, value_offset: str | None = None):
+        self.dim = dim
+        self.head_dim = head_dim
+        self.value_offset = value_offset
+
+    def convert(
+        self,
+        input_dict: dict[str, torch.Tensor],
+        source_patterns: list[str],
+        target_patterns: list[str],
+        config: Any = None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        import torch
+
+        from .integrations.gguf_dequant import GGUFQuantizedTensor
+
+        target_pattern = _single_input_target(input_dict, source_patterns, target_patterns)
+        tensors = next(iter(input_dict.values()))
+        tensor = tensors[0] if isinstance(tensors, list) else tensors
+        if isinstance(tensor, GGUFQuantizedTensor):
+            raise ValueError("Qwen3.5 value-head loading conversion requires a floating-point GGUF tensor")
+        if not tensor.is_floating_point():
+            raise ValueError("Qwen3.5 value-head loading conversion requires a floating-point tensor")
+
+        num_key_heads = config.linear_num_key_heads
+        num_value_heads = config.linear_num_value_heads
+        if num_value_heads % num_key_heads:
+            raise ValueError(
+                "Qwen3.5 linear_num_value_heads must be divisible by linear_num_key_heads, got "
+                f"{num_value_heads} and {num_key_heads}"
+            )
+        value_heads_per_key = num_value_heads // num_key_heads
+        head_dim = config.linear_value_head_dim if self.head_dim is None else self.head_dim
+        value_size = num_value_heads * head_dim
+        value_offset = 0
+        if self.value_offset == "qkv":
+            value_offset = 2 * config.linear_num_key_heads * config.linear_key_head_dim
+        elif self.value_offset is not None:
+            raise ValueError(f"Unknown Qwen3.5 value-head offset {self.value_offset!r}")
+
+        dim = self.dim % tensor.ndim
+        if tensor.shape[dim] < value_offset + value_size:
+            raise ValueError(
+                f"Qwen3.5 value-head dimension {tensor.shape[dim]} is smaller than the required "
+                f"offset plus value size {value_offset + value_size}"
+            )
+        physical_order = (
+            torch.arange(value_size, device=tensor.device)
+            .reshape(num_key_heads, value_heads_per_key, head_dim)
+            .transpose(0, 1)
+            .reshape(-1)
+        )
+        canonical_order = torch.argsort(physical_order)
+        values = tensor.narrow(dim, value_offset, value_size).index_select(dim, canonical_order)
+        pieces = []
+        if value_offset:
+            pieces.append(tensor.narrow(dim, 0, value_offset))
+        pieces.append(values)
+        suffix_offset = value_offset + value_size
+        if suffix_offset < tensor.shape[dim]:
+            pieces.append(tensor.narrow(dim, suffix_offset, tensor.shape[dim] - suffix_offset))
+        return {target_pattern: torch.cat(pieces, dim=dim) if len(pieces) > 1 else pieces[0]}
+
+    @property
+    def reverse_op(self) -> ConversionOps:
+        raise NotImplementedError("Qwen3_5ReorderValueHeads is one-way")
+
+
 class LogNegate(ConversionOps):
     """Apply ``log(-tensor)`` (used for GGUF Mamba SSM-A de-transform)."""
 
