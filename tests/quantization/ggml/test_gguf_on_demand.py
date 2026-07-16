@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from transformers import GGUFConfig
-from transformers.testing_utils import require_gguf, require_torch
+from transformers.testing_utils import require_gguf, require_torch, require_torch_bf16, require_torch_gpu, torch_device
 from transformers.utils import is_gguf_available, is_torch_available
 
 
@@ -47,6 +47,36 @@ if is_gguf_available():
 
 def _float_bytes(tensor):
     return tensor.detach().cpu().numpy().view(np.uint8).reshape(*tensor.shape[:-1], -1)
+
+
+def _make_test_gguf_experts(*, packed=True, full_weights=None, hidden_size=8, intermediate_size=12):
+    config = Qwen3MoeConfig(
+        hidden_size=hidden_size,
+        moe_intermediate_size=intermediate_size,
+        num_experts=4,
+        num_experts_per_tok=2,
+        hidden_act="silu",
+    )
+    module = GGUFExperts(config, compute_dtype=torch.float32)
+    if full_weights is None:
+        torch.manual_seed(0)
+        full_weights = {
+            "gate_proj": torch.randn(4, intermediate_size, hidden_size),
+            "up_proj": torch.randn(4, intermediate_size, hidden_size),
+            "down_proj": torch.randn(4, hidden_size, intermediate_size),
+        }
+    for name, full_weight in full_weights.items():
+        parameter = (
+            GGUFQuantizedTensor(
+                torch.from_numpy(_float_bytes(full_weight)),
+                quant_type=gguf.GGMLQuantizationType.F32,
+                logical_shape=full_weight.shape,
+            )
+            if packed
+            else torch.nn.Parameter(full_weight.clone(), requires_grad=False)
+        )
+        setattr(module, name, parameter)
+    return module, full_weights
 
 
 @require_torch
@@ -854,6 +884,245 @@ class GGUFOnDemandTests(unittest.TestCase):
         self.assertEqual(dict(module.named_buffers()), {})
         self.assertEqual(set(dict(module.named_parameters())), {"gate_proj", "up_proj", "down_proj"})
         self.assertTrue(all(not param.requires_grad for param in module.parameters()))
+
+    def test_gguf_expert_backward_redequantizes_without_saving_dense_weights(self):
+        from unittest.mock import patch
+
+        module, _ = _make_test_gguf_experts()
+        hidden_states = torch.randn(3, 8)
+        top_k_index = torch.tensor([[0, 1], [2, 1], [0, 2]])
+        top_k_weights = torch.tensor([[0.7, 0.3], [0.4, 0.6], [0.2, 0.8]])
+        logical_weight_shapes = {
+            (12, 8),
+            (8, 12),
+            (3, 12, 8),
+            (3, 8, 12),
+            (6, 12, 8),
+            (6, 8, 12),
+        }
+
+        for implementation in ("eager", "grouped_mm", "batched_mm"):
+            with self.subTest(implementation=implementation):
+                module.config._experts_implementation_internal = implementation
+                inputs = hidden_states.detach().clone().requires_grad_(True)
+                routing_weights = top_k_weights.detach().clone().requires_grad_(True)
+                saved_tensors = []
+
+                def pack_hook(tensor):
+                    saved_tensors.append(tensor)
+                    return tensor
+
+                with patch(
+                    "transformers.integrations.gguf.dequantize_gguf_tensor", wraps=dequantize_gguf_tensor
+                ) as dequantize:
+                    with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda tensor: tensor):
+                        output = module(inputs, top_k_index, routing_weights)
+                    expected_forward_calls = 9 if implementation == "eager" else 3
+                    self.assertEqual(dequantize.call_count, expected_forward_calls)
+                    output.sum().backward()
+                    self.assertEqual(dequantize.call_count, 2 * expected_forward_calls)
+
+                packed_saved = [tensor for tensor in saved_tensors if tensor.dtype == torch.uint8]
+                self.assertEqual(len(packed_saved), expected_forward_calls)
+                self.assertTrue(all(tensor.numel() == module.gate_proj.numel() for tensor in packed_saved))
+                self.assertFalse(
+                    any(
+                        tensor.is_floating_point() and tuple(tensor.shape) in logical_weight_shapes
+                        for tensor in saved_tensors
+                    )
+                )
+                self.assertIsNotNone(inputs.grad)
+                self.assertIsNotNone(routing_weights.grad)
+                self.assertTrue(all(parameter.grad is None for parameter in module.parameters()))
+
+    def test_gguf_expert_dtype_matrix_matches_floating_reference(self):
+        packed_module, full_weights = _make_test_gguf_experts(intermediate_size=16)
+        floating_module, _ = _make_test_gguf_experts(
+            packed=False,
+            full_weights=full_weights,
+            intermediate_size=16,
+        )
+        hidden_states = torch.randn(3, 8)
+        top_k_index = torch.tensor([[0, 1], [2, 1], [0, 2]])
+        top_k_weights = torch.tensor([[0.7, 0.3], [0.4, 0.6], [0.2, 0.8]])
+        grad_output = torch.randn_like(hidden_states)
+
+        for implementation in ("eager", "grouped_mm", "batched_mm"):
+            packed_module.config._experts_implementation_internal = implementation
+            floating_module.config._experts_implementation_internal = implementation
+            for input_dtype in (torch.float16, torch.bfloat16, torch.float32):
+                for compute_dtype in (torch.float16, torch.bfloat16, torch.float32):
+                    with self.subTest(
+                        implementation=implementation,
+                        input_dtype=input_dtype,
+                        compute_dtype=compute_dtype,
+                    ):
+                        packed_module.set_compute_dtype(compute_dtype)
+                        floating_module.set_compute_dtype(compute_dtype)
+                        inputs = hidden_states.to(input_dtype).detach().clone().requires_grad_(True)
+                        routing_weights = top_k_weights.detach().clone().requires_grad_(True)
+                        reference_inputs = hidden_states.to(input_dtype).detach().clone().requires_grad_(True)
+                        reference_routing_weights = top_k_weights.detach().clone().requires_grad_(True)
+
+                        actual = packed_module(inputs, top_k_index, routing_weights)
+                        expected = floating_module(reference_inputs, top_k_index, reference_routing_weights)
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+                        actual.backward(grad_output.to(input_dtype))
+                        expected.backward(grad_output.to(input_dtype))
+                        assert inputs.grad is not None and reference_inputs.grad is not None
+                        torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=0, atol=0)
+                        assert routing_weights.grad is not None and reference_routing_weights.grad is not None
+                        torch.testing.assert_close(
+                            routing_weights.grad, reference_routing_weights.grad, rtol=0, atol=0
+                        )
+
+    def test_gguf_expert_autocast_matches_floating_reference(self):
+        packed_module, full_weights = _make_test_gguf_experts()
+        floating_module, _ = _make_test_gguf_experts(packed=False, full_weights=full_weights)
+        hidden_states = torch.randn(3, 8)
+        top_k_index = torch.tensor([[0, 1], [2, 1], [0, 2]])
+        top_k_weights = torch.tensor([[0.7, 0.3], [0.4, 0.6], [0.2, 0.8]])
+        grad_output = torch.randn_like(hidden_states)
+
+        for implementation in ("eager", "grouped_mm", "batched_mm"):
+            with self.subTest(implementation=implementation):
+                packed_module.config._experts_implementation_internal = implementation
+                floating_module.config._experts_implementation_internal = implementation
+                inputs = hidden_states.detach().clone().requires_grad_(True)
+                routing_weights = top_k_weights.detach().clone().requires_grad_(True)
+                reference_inputs = hidden_states.detach().clone().requires_grad_(True)
+                reference_routing_weights = top_k_weights.detach().clone().requires_grad_(True)
+
+                with torch.autocast("cpu", dtype=torch.bfloat16):
+                    actual = packed_module(inputs, top_k_index, routing_weights)
+                    expected = floating_module(reference_inputs, top_k_index, reference_routing_weights)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+                actual.backward(grad_output)
+                expected.backward(grad_output)
+                assert inputs.grad is not None and reference_inputs.grad is not None
+                torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=0, atol=0)
+                assert routing_weights.grad is not None and reference_routing_weights.grad is not None
+                torch.testing.assert_close(routing_weights.grad, reference_routing_weights.grad, rtol=0, atol=0)
+
+    @require_torch_gpu
+    @require_torch_bf16
+    def test_gguf_expert_accelerator_autocast_matches_floating_reference(self):
+        packed_module, full_weights = _make_test_gguf_experts(intermediate_size=16)
+        floating_module, _ = _make_test_gguf_experts(
+            packed=False,
+            full_weights=full_weights,
+            intermediate_size=16,
+        )
+        packed_module.to(torch_device)
+        floating_module.to(torch_device)
+        hidden_states = torch.randn(3, 8, device=torch_device)
+        top_k_index = torch.tensor([[0, 1], [2, 1], [0, 2]], device=torch_device)
+        top_k_weights = torch.tensor(
+            [[0.7, 0.3], [0.4, 0.6], [0.2, 0.8]],
+            device=torch_device,
+        )
+        grad_output = torch.randn_like(hidden_states)
+
+        for implementation in ("eager", "grouped_mm", "batched_mm"):
+            with self.subTest(implementation=implementation):
+                packed_module.config._experts_implementation_internal = implementation
+                floating_module.config._experts_implementation_internal = implementation
+                inputs = hidden_states.detach().clone().requires_grad_(True)
+                routing_weights = top_k_weights.detach().clone().requires_grad_(True)
+                reference_inputs = hidden_states.detach().clone().requires_grad_(True)
+                reference_routing_weights = top_k_weights.detach().clone().requires_grad_(True)
+
+                with torch.autocast(torch_device, dtype=torch.bfloat16):
+                    actual = packed_module(inputs, top_k_index, routing_weights)
+                    expected = floating_module(reference_inputs, top_k_index, reference_routing_weights)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+                actual.backward(grad_output)
+                expected.backward(grad_output)
+                assert inputs.grad is not None and reference_inputs.grad is not None
+                torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=0, atol=0)
+                assert routing_weights.grad is not None and reference_routing_weights.grad is not None
+                torch.testing.assert_close(routing_weights.grad, reference_routing_weights.grad, rtol=0, atol=0)
+
+    def test_gguf_expert_reentrant_checkpointing_preserves_gradients_and_counts(self):
+        from unittest.mock import patch
+
+        from torch.utils.checkpoint import checkpoint
+
+        module, _ = _make_test_gguf_experts()
+        hidden_states = torch.randn(3, 8)
+        top_k_index = torch.tensor([[0, 1], [2, 1], [0, 2]])
+        top_k_weights = torch.tensor([[0.7, 0.3], [0.4, 0.6], [0.2, 0.8]])
+        grad_output = torch.randn_like(hidden_states)
+
+        for implementation in ("eager", "grouped_mm", "batched_mm"):
+            with self.subTest(implementation=implementation):
+                module.config._experts_implementation_internal = implementation
+                reference_inputs = hidden_states.detach().clone().requires_grad_(True)
+                reference_routing_weights = top_k_weights.detach().clone().requires_grad_(True)
+                with torch.autocast("cpu", dtype=torch.bfloat16):
+                    expected = module(reference_inputs, top_k_index, reference_routing_weights)
+                expected.backward(grad_output)
+
+                inputs = hidden_states.detach().clone().requires_grad_(True)
+                routing_weights = top_k_weights.detach().clone().requires_grad_(True)
+                with patch(
+                    "transformers.integrations.gguf.dequantize_gguf_tensor", wraps=dequantize_gguf_tensor
+                ) as dequantize:
+                    with torch.autocast("cpu", dtype=torch.bfloat16):
+                        actual = checkpoint(
+                            lambda states, weights: module(states, top_k_index, weights),
+                            inputs,
+                            routing_weights,
+                            use_reentrant=True,
+                        )
+                    expected_forward_calls = 9 if implementation == "eager" else 3
+                    self.assertEqual(dequantize.call_count, expected_forward_calls)
+                    actual.backward(grad_output)
+                    self.assertEqual(dequantize.call_count, 3 * expected_forward_calls)
+
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                assert inputs.grad is not None and reference_inputs.grad is not None
+                torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=0, atol=0)
+                assert routing_weights.grad is not None and reference_routing_weights.grad is not None
+                torch.testing.assert_close(routing_weights.grad, reference_routing_weights.grad, rtol=0, atol=0)
+
+    def test_gguf_expert_custom_backward_requires_input_gradients(self):
+        from unittest.mock import patch
+
+        from transformers.integrations.gguf import _GGUFExpertProjectionFunction
+
+        module, _ = _make_test_gguf_experts()
+        hidden_states = torch.randn(3, 8)
+        top_k_index = torch.tensor([[0, 1], [2, 1], [0, 2]])
+        top_k_weights = torch.tensor([[0.7, 0.3], [0.4, 0.6], [0.2, 0.8]])
+
+        for implementation in ("eager", "grouped_mm", "batched_mm"):
+            with self.subTest(implementation=implementation):
+                module.config._experts_implementation_internal = implementation
+                routing_weights = top_k_weights.detach().clone().requires_grad_(True)
+                with patch.object(
+                    _GGUFExpertProjectionFunction,
+                    "apply",
+                    wraps=_GGUFExpertProjectionFunction.apply,
+                ) as projection:
+                    output = module(hidden_states, top_k_index, routing_weights)
+                    self.assertEqual(projection.call_count, 0)
+                    output.sum().backward()
+                    self.assertIsNotNone(routing_weights.grad)
+
+                with (
+                    patch.object(
+                        _GGUFExpertProjectionFunction,
+                        "apply",
+                        wraps=_GGUFExpertProjectionFunction.apply,
+                    ) as projection,
+                    torch.no_grad(),
+                ):
+                    module(hidden_states, top_k_index, top_k_weights)
+                    self.assertEqual(projection.call_count, 0)
 
     def test_qwen3_moe_replacement_and_converter_rewrite(self):
         from transformers.core_model_loading import WeightRenaming
