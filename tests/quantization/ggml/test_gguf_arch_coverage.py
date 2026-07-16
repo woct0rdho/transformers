@@ -43,6 +43,7 @@ EXPECTED_MODEL_TYPES = sorted(
         "qwen2",
         "qwen3",
         "qwen3_5_text",
+        "qwen3_5_moe_text",
         "deci",
         "stablelm",
         "starcoder2",
@@ -94,7 +95,14 @@ class GgufArchCoverageTests(unittest.TestCase):
         """Qwen GGUF files retain Hugging Face's split-half Q/K layout for NeoX RoPE."""
         from transformers.gguf_conversion_ops import ReversePermuteAttnK, ReversePermuteAttnQ
 
-        for model_type in ("qwen2", "qwen3", "qwen3_5_text", "qwen2_moe", "qwen3_moe"):
+        for model_type in (
+            "qwen2",
+            "qwen3",
+            "qwen3_5_text",
+            "qwen2_moe",
+            "qwen3_moe",
+            "qwen3_5_moe_text",
+        ):
             rules = get_gguf_converters(model_type)
             source_patterns = [source for rule in rules for source in rule.source_patterns]
             self.assertTrue(any(re.search(source, "model.layers.0.attn_q.weight") for source in source_patterns))
@@ -164,6 +172,43 @@ class GgufArchCoverageTests(unittest.TestCase):
         )
         self.assertFalse(any(key.startswith("_gguf_") for key in config))
 
+    def test_qwen35_moe_config_reconstruction(self):
+        config = {
+            "model_type": "qwen3_5_moe_text",
+            "max_position_embeddings": 262144,
+            "num_hidden_layers": 4,
+            "hidden_size": 2048,
+            "head_dim": 256,
+            "_gguf_attention_value_length": 256,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-6,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "_gguf_linear_inner_size": 4096,
+            "_gguf_rope_dimension_count": 64,
+            "_gguf_rope_dimension_sections": [11, 11, 10, 0],
+            "_gguf_rope_theta": 10_000_000.0,
+            "_gguf_full_attention_interval": 4,
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 512,
+            "shared_expert_intermediate_size": 512,
+        }
+        _postprocess_qwen35_config(config)
+        self.assertEqual(config["model_type"], "qwen3_5_moe_text")
+        self.assertEqual(config["linear_value_head_dim"], 128)
+        self.assertEqual(config["num_experts"], 256)
+        self.assertEqual(config["num_experts_per_tok"], 8)
+        self.assertEqual(config["moe_intermediate_size"], 512)
+        self.assertEqual(config["shared_expert_intermediate_size"], 512)
+        self.assertEqual(
+            config["layer_types"],
+            ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        )
+
     def test_qwen35_explicit_recurrent_layers_override_interval(self):
         config = {
             "num_hidden_layers": 4,
@@ -206,6 +251,23 @@ class GgufArchCoverageTests(unittest.TestCase):
         }
         for source, expected in expected_names.items():
             actual, _ = rename_source_key(source, renamings, converters)
+            self.assertEqual(actual, expected)
+
+        moe_rules = get_gguf_converters("qwen3_5_moe_text")
+        moe_renamings = [rule for rule in moe_rules if isinstance(rule, WeightRenaming)]
+        moe_converters = [rule for rule in moe_rules if isinstance(rule, WeightConverter)]
+        expected_moe_names = {
+            "blk.0.ffn_gate_inp.weight": "model.layers.0.mlp.gate.weight",
+            "blk.0.ffn_gate_exps.weight": "model.layers.0.mlp.experts.gate_up_proj",
+            "blk.0.ffn_up_exps.weight": "model.layers.0.mlp.experts.gate_up_proj",
+            "blk.0.ffn_down_exps.weight": "model.layers.0.mlp.experts.down_proj",
+            "blk.0.ffn_gate_shexp.weight": "model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "blk.0.ffn_up_shexp.weight": "model.layers.0.mlp.shared_expert.up_proj.weight",
+            "blk.0.ffn_down_shexp.weight": "model.layers.0.mlp.shared_expert.down_proj.weight",
+            "blk.0.ffn_gate_inp_shexp.weight": "model.layers.0.mlp.shared_expert_gate.weight",
+        }
+        for source, expected in expected_moe_names.items():
+            actual, _ = rename_source_key(source, moe_renamings, moe_converters)
             self.assertEqual(actual, expected)
 
         config = SimpleNamespace(

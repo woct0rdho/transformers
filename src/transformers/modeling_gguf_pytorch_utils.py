@@ -355,6 +355,21 @@ if is_torch_available():
     _QWEN3_MOE_CONVERTERS = _QWEN2_MOE_CONVERTERS + [
         WeightRenaming(r"\.attn_(q|k)_norm\.weight", r".self_attn.\1_norm.weight"),
     ]
+    _QWEN35_MOE_CONVERTERS = _QWEN35_CONVERTERS + [
+        WeightRenaming(r"\.ffn_(gate|up|down)_shexp\.weight", r".mlp.shared_expert.\1_proj.weight"),
+        WeightRenaming(r"\.ffn_gate_inp\.weight", ".mlp.gate.weight"),
+        WeightRenaming(r"\.ffn_down_exps\.weight", ".mlp.experts.down_proj"),
+        WeightConverter(
+            source_patterns=r"\.ffn_gate_inp_shexp",
+            target_patterns=".mlp.shared_expert_gate",
+            operations=[Unsqueeze(0)],
+        ),
+        WeightConverter(
+            source_patterns=[r"\.ffn_gate_exps\.weight", r"\.ffn_up_exps\.weight"],
+            target_patterns=".mlp.experts.gate_up_proj",
+            operations=[Concatenate(dim=1)],
+        ),
+    ]
 
     # --- Bloom -----------------------------------------------------------------
     _BLOOM_CONVERTERS = [
@@ -470,6 +485,7 @@ if is_torch_available():
         # MoE
         "qwen2_moe": _QWEN2_MOE_CONVERTERS,
         "qwen3_moe": _QWEN3_MOE_CONVERTERS,
+        "qwen3_5_moe_text": _QWEN35_MOE_CONVERTERS,
         "minimax_m2": _MINIMAX_M2_CONVERTERS,
         "gpt_oss": _GPT_OSS_CONVERTERS,
         # T5 / UMT5 / T5-encoder share the same encoder–decoder mapping
@@ -637,6 +653,8 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
         updated_architecture = "qwen3_moe"
     elif architecture == "qwen35":
         updated_architecture = "qwen3_5_text"
+    elif architecture == "qwen35moe":
+        updated_architecture = "qwen3_5_moe_text"
 
     # For stablelm architecture, we need to set qkv_bias and use_parallel_residual from tensors
     # If `qkv_bias=True`, qkv_proj with bias will be present in the tensors
@@ -696,7 +714,7 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
         if gguf_key in reader_keys:
             logger.info(f"Some keys were not parsed and added into account {gguf_key} | {value}")
 
-    if parsed_parameters["config"]["model_type"] == "qwen3_5_text":
+    if parsed_parameters["config"]["model_type"] in {"qwen3_5_text", "qwen3_5_moe_text"}:
         _postprocess_qwen35_config(parsed_parameters["config"])
 
     # Gemma3 GGUF checkpoint only contains weights of text backbone
