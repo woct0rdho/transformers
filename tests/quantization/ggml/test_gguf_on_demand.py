@@ -278,6 +278,9 @@ class GGUFOnDemandTests(unittest.TestCase):
             experts(torch.randn(2, 6), torch.tensor([[0], [2]]), torch.ones(2, 1))
 
     def test_gguf_expert_factory_uses_generic_source_contract_and_dtype(self):
+        from transformers.integrations.gguf import ALL_GGUF_EXPERTS_FUNCTIONS
+        from transformers.integrations.moe import batched_mm_experts_forward, grouped_mm_experts_forward
+
         config = SimpleNamespace(_experts_implementation="eager")
 
         @use_experts_implementation
@@ -297,6 +300,10 @@ class GGUFOnDemandTests(unittest.TestCase):
         source = CompatibleExperts(config)
         self.assertEqual(source.projection_layout, "concatenated_gate_up")
         self.assertEqual(source.gate_implementation, "default")
+        self.assertEqual(set(source._get_expert_projection_tensors()), {"gate_up", "down"})
+        self.assertTrue(source.experts_implementation_switchable)
+        self.assertIs(ALL_GGUF_EXPERTS_FUNCTIONS["grouped_mm"], grouped_mm_experts_forward)
+        self.assertIs(ALL_GGUF_EXPERTS_FUNCTIONS["batched_mm"], batched_mm_experts_forward)
 
         container = torch.nn.Module()
         container.experts = source
@@ -312,6 +319,44 @@ class GGUFOnDemandTests(unittest.TestCase):
             ("eager", "grouped_mm", "batched_mm"),
         )
         self.assertTrue(replacement.experts_implementation_switchable)
+
+        @use_experts_implementation
+        class ProviderBackedExperts(torch.nn.Module):
+            def __init__(self, config):
+                super().__init__()
+                self.num_experts = 3
+                self.hidden_dim = 6
+                self.intermediate_dim = 4
+                self.fused_input = torch.nn.Parameter(torch.empty(3, 8, 6, dtype=torch.float64, device="meta"))
+                self.output = torch.nn.Parameter(torch.empty(3, 6, 4, dtype=torch.float64, device="meta"))
+                self.act_fn = F.silu
+
+            def _get_expert_projection_tensors(self):
+                return {"gate_up": self.fused_input, "down": self.output}
+
+            def forward(self, hidden_states, top_k_index, top_k_weights):
+                raise NotImplementedError
+
+        provider_container = torch.nn.Module()
+        provider_container.experts = ProviderBackedExperts(config)
+        replace_with_gguf_modules(provider_container)
+        provider_replacement: Any = provider_container.experts
+        self.assertIsInstance(provider_replacement, GGUFExperts)
+        self.assertEqual(provider_replacement.compute_dtype, torch.float64)
+        self.assertEqual(
+            (provider_replacement.num_experts, provider_replacement.hidden_dim, provider_replacement.intermediate_dim),
+            (3, 6, 4),
+        )
+
+        invalid_provider_container = torch.nn.Module()
+        invalid_provider_container.experts = ProviderBackedExperts(config)
+        object.__setattr__(
+            invalid_provider_container.experts,
+            "_get_expert_projection_tensors",
+            lambda: {"gate_up": object()},
+        )
+        with self.assertRaisesRegex(ValueError, "string keys and tensor values"):
+            replace_with_gguf_modules(invalid_provider_container)
 
         for attribute, value, error in (
             ("has_bias", True, "projection bias"),
@@ -1174,9 +1219,16 @@ class GGUFOnDemandTests(unittest.TestCase):
         self.assertEqual(quantizer.param_element_size(model, gate_name, experts.gate_proj), 0.25)
 
         previous_implementation = model.config._experts_implementation
-        with self.assertRaisesRegex(ValueError, "GGUF experts do not support 'deepgemm'"):
+        with self.assertRaisesRegex(ValueError, "'deepgemm' is not supported by GGUFExpertsInterface"):
             model.set_experts_implementation("deepgemm")
         self.assertEqual(model.config._experts_implementation, previous_implementation)
+        with self.assertRaisesRegex(ValueError, "'deepgemm' is not supported by GGUFExpertsInterface"):
+            model.set_experts_implementation({"": "deepgemm"})
+        self.assertEqual(model.config._experts_implementation, previous_implementation)
+
+        model.set_experts_implementation({"": "batched_mm"})
+        self.assertEqual(model.config._experts_implementation, "batched_mm")
+        model.set_experts_implementation({"": previous_implementation})
 
         custom_implementation = "test_gguf_custom_experts"
         ALL_GGUF_EXPERTS_FUNCTIONS[custom_implementation] = lambda *args, **kwargs: None
@@ -1191,7 +1243,7 @@ class GGUFOnDemandTests(unittest.TestCase):
         with torch.device("meta"):
             invalid_model = Qwen3MoeForCausalLM(invalid_config)
         invalid_model.config._experts_implementation_internal = "deepgemm"
-        with self.assertRaisesRegex(ValueError, "GGUF experts do not support 'deepgemm'"):
+        with self.assertRaisesRegex(ValueError, "'deepgemm' is not supported by GGUFExpertsInterface"):
             quantizer.preprocess_model(invalid_model, dtype=torch.float32, device_map={"": "cpu"})
         self.assertNotIsInstance(invalid_model.get_submodule("model.layers.0.mlp.experts"), GGUFExperts)
 

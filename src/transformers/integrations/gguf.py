@@ -25,7 +25,11 @@ from .moe import (
     ExpertsInterface,
     _batched_linear,
     _default_apply_gate,
+    _ExpertExecutionPlan,
+    _ExpertRoutingPlan,
     _grouped_linear,
+    batched_mm_experts_forward,
+    grouped_mm_experts_forward,
     use_experts_implementation,
 )
 
@@ -34,17 +38,21 @@ def _dequantize_weight(weight: GGUFQuantizedTensor, dtype: torch.dtype, device: 
     return dequantize_gguf_tensor(weight, weight.quant_type, dtype=dtype, device=device)
 
 
-def _dequantize_expert_payload(payload, quant_type, expert_indices, dtype, device):
-    expert_indices = expert_indices.to(payload.device)
-    selected = payload.index_select(0, expert_indices)
+def _dequantize_selected_payload(
+    payload: torch.Tensor,
+    quant_type,
+    indices: torch.Tensor,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    indices = indices.to(payload.device)
+    selected = payload.index_select(0, indices)
     return dequantize_gguf_tensor(selected, quant_type, dtype=dtype, device=device)
 
 
 def _dequantize_rows(weight: GGUFQuantizedTensor, rows: torch.Tensor, dtype, device):
     payload = weight.as_subclass(torch.Tensor)
-    rows = rows.to(payload.device)
-    selected = payload.index_select(0, rows)
-    return dequantize_gguf_tensor(selected, weight.quant_type, dtype=dtype, device=device)
+    return _dequantize_selected_payload(payload, weight.quant_type, rows, dtype, device)
 
 
 def _dequantize_experts(weight: torch.Tensor, expert_indices: torch.Tensor, dtype, device):
@@ -53,9 +61,27 @@ def _dequantize_experts(weight: torch.Tensor, expert_indices: torch.Tensor, dtyp
     return _dequantize_rows(weight, expert_indices, dtype, device)
 
 
+def _expert_projection_tensors(module: nn.Module) -> dict[str, torch.Tensor]:
+    provider = getattr(module, "_get_expert_projection_tensors", None)
+    if callable(provider):
+        projections = provider()
+        if not isinstance(projections, dict) or not all(
+            isinstance(name, str) and isinstance(weight, torch.Tensor) for name, weight in projections.items()
+        ):
+            raise ValueError("Expert projection providers must return a dictionary with string keys and tensor values")
+        return projections
+
+    projections = {"down": getattr(module, "down_proj", None)}
+    if getattr(module, "has_gate", True):
+        projections["gate_up"] = getattr(module, "gate_up_proj", None)
+    else:
+        projections["up"] = getattr(module, "up_proj", None)
+    return projections
+
+
 def _get_expert_weight_state(module: nn.Module) -> str:
     states = []
-    for weight in (module.gate_proj, module.up_proj, module.down_proj):
+    for weight in _expert_projection_tensors(module).values():
         if isinstance(weight, GGUFQuantizedTensor):
             states.append("packed")
         elif weight.is_floating_point():
@@ -82,29 +108,52 @@ def _validate_expert_indices(expert_indices: torch.Tensor, num_experts: int):
         raise IndexError("GGUF experts do not support expert-parallel sentinel indices")
 
 
-def _run_expert_projection(input, weight, mode, route_indices=None, offsets=None):
-    if mode == "eager":
+def _save_gguf_autocast_state(ctx, input, compute_dtype):
+    device_type = input.device.type
+    ctx.autocast_enabled = torch.is_autocast_enabled(device_type)
+    ctx.autocast_dtype = torch.get_autocast_dtype(device_type)
+    ctx.compute_dtype = compute_dtype
+    ctx.device_type = device_type
+    ctx.input_dtype = input.dtype
+
+
+def _linear_input_gradient(grad_output, weight, input_dtype):
+    flat_grad_output = grad_output.reshape(-1, grad_output.shape[-1])
+    grad_input = torch.mm(flat_grad_output, weight)
+    return grad_input.reshape(*grad_output.shape[:-1], weight.shape[-1]).to(input_dtype)
+
+
+def _run_expert_projection(input, weight, implementation, route_indices=None, offsets=None):
+    if implementation == "eager":
         return F.linear(input, weight.squeeze(0))
-    if mode == "grouped":
+    if implementation == "grouped_mm":
         return _grouped_linear(input, weight, offsets)
-    if mode == "batched":
+    if implementation == "batched_mm":
         route_weight = weight.index_select(0, route_indices)
         return _batched_linear(input, route_weight)
-    raise ValueError(f"Unknown GGUF expert projection mode {mode!r}")
+    raise ValueError(f"Unknown GGUF expert projection implementation {implementation!r}")
+
+
+def _run_expert_input_gradient(grad_output, weight, implementation, input_dtype, route_indices=None, offsets=None):
+    if implementation == "eager":
+        return _linear_input_gradient(grad_output, weight.squeeze(0), input_dtype)
+    if implementation == "grouped_mm":
+        grad_input = _grouped_linear(grad_output, weight, offsets, is_transposed=True)
+    elif implementation == "batched_mm":
+        route_weight = weight.index_select(0, route_indices)
+        grad_input = _batched_linear(grad_output, route_weight, is_transposed=True)
+    else:
+        raise ValueError(f"Unknown GGUF expert projection implementation {implementation!r}")
+    return grad_input.to(input_dtype)
 
 
 class _GGUFExpertProjectionFunction(torch.autograd.Function):
     """Recompute selected frozen GGUF expert weights for input gradients."""
 
     @staticmethod
-    def forward(ctx, input, weight, expert_indices, route_indices, offsets, compute_dtype, mode):
-        device_type = input.device.type
-        ctx.autocast_enabled = torch.is_autocast_enabled(device_type)
-        ctx.autocast_dtype = torch.get_autocast_dtype(device_type)
-        ctx.compute_dtype = compute_dtype
-        ctx.device_type = device_type
-        ctx.input_dtype = input.dtype
-        ctx.mode = mode
+    def forward(ctx, input, weight, expert_indices, route_indices, offsets, compute_dtype, implementation):
+        _save_gguf_autocast_state(ctx, input, compute_dtype)
+        ctx.implementation = implementation
         ctx.quant_type = weight.quant_type
         ctx.has_route_indices = route_indices is not None
         ctx.has_offsets = offsets is not None
@@ -117,7 +166,7 @@ class _GGUFExpertProjectionFunction(torch.autograd.Function):
             ctx.save_for_backward(*saved_tensors)
 
         dense_weight = _dequantize_experts(weight, expert_indices, compute_dtype, input.device)
-        return _run_expert_projection(input, dense_weight, mode, route_indices, offsets)
+        return _run_expert_projection(input, dense_weight, implementation, route_indices, offsets)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -133,30 +182,21 @@ class _GGUFExpertProjectionFunction(torch.autograd.Function):
                 dtype=ctx.autocast_dtype,
                 enabled=ctx.autocast_enabled,
             ):
-                dense_weight = _dequantize_expert_payload(
+                dense_weight = _dequantize_selected_payload(
                     payload,
                     ctx.quant_type,
                     expert_indices,
                     ctx.compute_dtype,
                     grad_output.device,
                 )
-                if ctx.mode == "eager":
-                    flat_grad_output = grad_output.reshape(-1, grad_output.shape[-1])
-                    grad_input = torch.mm(flat_grad_output, dense_weight.squeeze(0))
-                    grad_input = grad_input.reshape(*grad_output.shape[:-1], dense_weight.shape[-1])
-                elif ctx.mode == "grouped":
-                    grad_input = _grouped_linear(
-                        grad_output,
-                        dense_weight,
-                        offsets,
-                        is_transposed=True,
-                    )
-                elif ctx.mode == "batched":
-                    route_weight = dense_weight.index_select(0, route_indices)
-                    grad_input = _batched_linear(grad_output, route_weight, is_transposed=True)
-                else:
-                    raise ValueError(f"Unknown GGUF expert projection mode {ctx.mode!r}")
-                grad_input = grad_input.to(ctx.input_dtype)
+                grad_input = _run_expert_input_gradient(
+                    grad_output,
+                    dense_weight,
+                    ctx.implementation,
+                    ctx.input_dtype,
+                    route_indices,
+                    offsets,
+                )
 
         return grad_input, None, None, None, None, None, None
 
@@ -166,7 +206,7 @@ def _expert_projection(
     weight,
     expert_indices,
     compute_dtype,
-    mode,
+    implementation,
     route_indices=None,
     offsets=None,
 ):
@@ -178,10 +218,10 @@ def _expert_projection(
             route_indices,
             offsets,
             compute_dtype,
-            mode,
+            implementation,
         )
     dense_weight = _dequantize_experts(weight, expert_indices, compute_dtype, input.device)
-    return _run_expert_projection(input, dense_weight, mode, route_indices, offsets)
+    return _run_expert_projection(input, dense_weight, implementation, route_indices, offsets)
 
 
 class _GGUFLinearFunction(torch.autograd.Function):
@@ -189,13 +229,8 @@ class _GGUFLinearFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input, weight, bias, compute_dtype):
-        device_type = input.device.type
-        ctx.autocast_enabled = torch.is_autocast_enabled(device_type)
-        ctx.autocast_dtype = torch.get_autocast_dtype(device_type)
+        _save_gguf_autocast_state(ctx, input, compute_dtype)
         ctx.bias_dtype = bias.dtype if bias is not None else None
-        ctx.compute_dtype = compute_dtype
-        ctx.device_type = device_type
-        ctx.input_dtype = input.dtype
         ctx.quant_type = weight.quant_type
         if ctx.needs_input_grad[0]:
             ctx.save_for_backward(weight.as_subclass(torch.Tensor))
@@ -219,9 +254,7 @@ class _GGUFLinearFunction(torch.autograd.Function):
                     dtype=ctx.compute_dtype,
                     device=grad_output.device,
                 )
-                flat_grad_output = grad_output.reshape(-1, grad_output.shape[-1])
-                grad_input = torch.mm(flat_grad_output, dense_weight)
-                grad_input = grad_input.reshape(*grad_output.shape[:-1], dense_weight.shape[-1]).to(ctx.input_dtype)
+                grad_input = _linear_input_gradient(grad_output, dense_weight, ctx.input_dtype)
 
         if ctx.needs_input_grad[2]:
             reduction_dims = tuple(range(grad_output.ndim - 1))
@@ -250,126 +283,14 @@ class _GGUFComputeDtypeMixin:
         return module
 
 
-def gguf_batched_mm_experts_forward(
-    self: nn.Module,
-    hidden_states: torch.Tensor,
-    top_k_index: torch.Tensor,
-    top_k_weights: torch.Tensor,
-) -> torch.Tensor:
-    _validate_expert_weights(self)
-    input_dtype = hidden_states.dtype
-    num_top_k = top_k_index.size(-1)
-    num_tokens = hidden_states.size(0)
-    expert_ids = top_k_index.reshape(-1)
-    _validate_expert_indices(expert_ids, self.num_experts)
-
-    selected_hidden_states = hidden_states.to(self.compute_dtype).repeat_interleave(num_top_k, dim=0)
-    active_experts, local_expert_ids = torch.unique(expert_ids, sorted=True, return_inverse=True)
-
-    gate = _expert_projection(
-        selected_hidden_states,
-        self.gate_proj,
-        active_experts,
-        self.compute_dtype,
-        "batched",
-        route_indices=local_expert_ids,
-    )
-    up = _expert_projection(
-        selected_hidden_states,
-        self.up_proj,
-        active_experts,
-        self.compute_dtype,
-        "batched",
-        route_indices=local_expert_ids,
-    )
-
-    intermediate = self._apply_split_gate(gate, up)
-    output = _expert_projection(
-        intermediate,
-        self.down_proj,
-        active_experts,
-        self.compute_dtype,
-        "batched",
-        route_indices=local_expert_ids,
-    )
-    output = output * top_k_weights.reshape(-1, 1).to(output.dtype)
-    return output.view(num_tokens, num_top_k, self.hidden_dim).sum(dim=1).to(input_dtype)
-
-
-def gguf_grouped_mm_experts_forward(
-    self: nn.Module,
-    hidden_states: torch.Tensor,
-    top_k_index: torch.Tensor,
-    top_k_weights: torch.Tensor,
-) -> torch.Tensor:
-    _validate_expert_weights(self)
-    input_dtype = hidden_states.dtype
-    num_top_k = top_k_index.size(-1)
-    num_tokens = hidden_states.size(0)
-    expert_ids = top_k_index.reshape(-1)
-    _validate_expert_indices(expert_ids, self.num_experts)
-
-    sorted_expert_ids, permutation = torch.sort(expert_ids)
-    selected_hidden_states = hidden_states.to(self.compute_dtype)[permutation // num_top_k]
-    selected_routing_weights = top_k_weights.reshape(-1)[permutation]
-    active_experts, expert_counts = torch.unique_consecutive(sorted_expert_ids, return_counts=True)
-    offsets = expert_counts.cumsum(0, dtype=torch.int32)
-
-    gate = _expert_projection(
-        selected_hidden_states,
-        self.gate_proj,
-        active_experts,
-        self.compute_dtype,
-        "grouped",
-        offsets=offsets,
-    )
-    up = _expert_projection(
-        selected_hidden_states,
-        self.up_proj,
-        active_experts,
-        self.compute_dtype,
-        "grouped",
-        offsets=offsets,
-    )
-
-    intermediate = self._apply_split_gate(gate, up)
-    output = _expert_projection(
-        intermediate,
-        self.down_proj,
-        active_experts,
-        self.compute_dtype,
-        "grouped",
-        offsets=offsets,
-    )
-    output = output * selected_routing_weights.unsqueeze(-1).to(output.dtype)
-
-    inverse_permutation = torch.empty_like(permutation)
-    inverse_permutation[permutation] = torch.arange(permutation.size(0), device=permutation.device)
-    output = output[inverse_permutation]
-    return output.view(num_tokens, num_top_k, self.hidden_dim).sum(dim=1).to(input_dtype)
-
-
 class GGUFExpertsInterface(ExpertsInterface):
     """Switchable MoE implementations that understand compressed GGUF expert parameters."""
 
+    display_name = "GGUFExpertsInterface"
     _global_mapping = {
-        "grouped_mm": gguf_grouped_mm_experts_forward,
-        "batched_mm": gguf_batched_mm_experts_forward,
+        "grouped_mm": grouped_mm_experts_forward,
+        "batched_mm": batched_mm_experts_forward,
     }
-
-    def supported_implementations(self) -> tuple[str, ...]:
-        return ("eager", *self.valid_keys())
-
-    def validate_implementation(self, experts_implementation: str | None) -> str | None:
-        if experts_implementation is not None and experts_implementation not in self.supported_implementations():
-            raise ValueError(
-                f"GGUF experts do not support {experts_implementation!r}; use 'eager', 'grouped_mm', or 'batched_mm'."
-            )
-        return experts_implementation
-
-    def get_interface(self, experts_implementation, default):
-        self.validate_implementation(experts_implementation)
-        return super().get_interface(experts_implementation, default)
 
 
 ALL_GGUF_EXPERTS_FUNCTIONS = GGUFExpertsInterface()
@@ -383,8 +304,76 @@ ALL_GGUF_EXPERTS_FUNCTIONS = GGUFExpertsInterface()
 class GGUFExperts(_GGUFComputeDtypeMixin, nn.Module):
     """Routed experts backed by separate compressed GGUF gate, up, and down payloads."""
 
-    supported_experts_implementations = ALL_GGUF_EXPERTS_FUNCTIONS.supported_implementations()
-    experts_implementation_switchable = True
+    def _prepare_expert_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states.to(self.compute_dtype)
+
+    def _prepare_expert_execution(
+        self,
+        routing_plan: _ExpertRoutingPlan,
+        implementation: str,
+    ) -> _ExpertExecutionPlan:
+        _validate_expert_weights(self)
+        _validate_expert_indices(routing_plan.expert_indices, self.num_experts)
+        if implementation == "batched_mm":
+            active_experts, local_expert_ids = torch.unique(
+                routing_plan.expert_indices,
+                sorted=True,
+                return_inverse=True,
+            )
+            return _ExpertExecutionPlan(active_experts, local_expert_ids, None, None, None)
+        if implementation == "grouped_mm":
+            active_experts, expert_counts = torch.unique_consecutive(
+                routing_plan.expert_indices,
+                return_counts=True,
+            )
+            offsets = expert_counts.cumsum(0, dtype=torch.int32)
+            return _ExpertExecutionPlan(active_experts, None, offsets, None, None)
+        raise ValueError(f"Unknown experts implementation {implementation!r}")
+
+    def _get_expert_projection_tensors(self) -> dict[str, torch.Tensor]:
+        return {"gate": self.gate_proj, "up": self.up_proj, "down": self.down_proj}
+
+    def _project_expert_weight(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        execution_plan: _ExpertExecutionPlan,
+        implementation: str,
+    ) -> torch.Tensor:
+        return _expert_projection(
+            hidden_states,
+            weight,
+            execution_plan.expert_indices,
+            self.compute_dtype,
+            implementation,
+            route_indices=execution_plan.route_indices,
+            offsets=execution_plan.offsets,
+        )
+
+    def _project_expert_up(
+        self,
+        hidden_states: torch.Tensor,
+        execution_plan: _ExpertExecutionPlan,
+        implementation: str,
+    ) -> torch.Tensor:
+        gate = self._project_expert_weight(hidden_states, self.gate_proj, execution_plan, implementation)
+        up = self._project_expert_weight(hidden_states, self.up_proj, execution_plan, implementation)
+        return self._apply_split_gate(gate, up)
+
+    def _project_expert_down(
+        self,
+        hidden_states: torch.Tensor,
+        execution_plan: _ExpertExecutionPlan,
+        implementation: str,
+    ) -> torch.Tensor:
+        return self._project_expert_weight(hidden_states, self.down_proj, execution_plan, implementation)
+
+    def _cast_expert_routing_weights(
+        self,
+        routing_weights: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return routing_weights.to(output.dtype)
 
     def __init__(
         self,
@@ -419,10 +408,6 @@ class GGUFExperts(_GGUFComputeDtypeMixin, nn.Module):
         )
 
     @classmethod
-    def _validate_supported_experts_implementation(cls, experts_implementation: str | None) -> str | None:
-        return ALL_GGUF_EXPERTS_FUNCTIONS.validate_implementation(experts_implementation)
-
-    @classmethod
     def _source_module_contract(cls, module: nn.Module):
         if not hasattr(module, "config"):
             raise ValueError("GGUF expert replacement requires a source module with a config")
@@ -451,10 +436,11 @@ class GGUFExperts(_GGUFComputeDtypeMixin, nn.Module):
         if gate_implementation != "default":
             raise ValueError("GGUF expert replacement does not yet support custom gate behavior")
 
-        gate_up_proj = getattr(module, "gate_up_proj", None)
-        down_proj = getattr(module, "down_proj", None)
+        projections = _expert_projection_tensors(module)
+        gate_up_proj = projections.get("gate_up")
+        down_proj = projections.get("down")
         if not isinstance(gate_up_proj, torch.Tensor) or not isinstance(down_proj, torch.Tensor):
-            raise ValueError("GGUF expert replacement requires gate_up_proj and down_proj tensor parameters")
+            raise ValueError("GGUF expert replacement requires gate_up and down projection tensors from its provider")
         if gate_up_proj.ndim != 3 or down_proj.ndim != 3:
             raise ValueError("GGUF expert replacement requires rank-3 expert projection tensors")
 
@@ -501,7 +487,8 @@ class GGUFExperts(_GGUFComputeDtypeMixin, nn.Module):
         config, num_experts, hidden_dim, intermediate_dim, device, source_dtype, act_fn = cls._source_module_contract(
             module
         )
-        cls._validate_supported_experts_implementation(getattr(config, "_experts_implementation", None))
+        validator = getattr(cls, "_validate_supported_experts_implementation")
+        validator(getattr(config, "_experts_implementation", None))
         return cls(
             config,
             device=device,
@@ -707,6 +694,14 @@ class GGUFEmbedding(_GGUFComputeDtypeMixin, nn.Embedding):
         return output.reshape(*input.shape, self.embedding_dim)
 
 
+def _is_expert_module_candidate(name: str, module: nn.Module) -> bool:
+    if name != "experts" and not name.endswith(".experts"):
+        return False
+    has_projection_provider = callable(getattr(module, "_get_expert_projection_tensors", None))
+    has_legacy_projections = all(hasattr(module, attribute) for attribute in ("gate_up_proj", "down_proj"))
+    return hasattr(module, "config") and (has_projection_provider or has_legacy_projections)
+
+
 def replace_with_gguf_modules(model, compute_dtype=None):
     """Replace linear, embedding, and structurally compatible routed-expert modules on the meta model."""
     modules = list(model.named_modules())
@@ -715,9 +710,7 @@ def replace_with_gguf_modules(model, compute_dtype=None):
             continue
         if isinstance(module, GGUFExperts):
             module._validate_supported_experts_implementation(getattr(module.config, "_experts_implementation", None))
-        elif (name == "experts" or name.endswith(".experts")) and all(
-            hasattr(module, attribute) for attribute in ("config", "gate_up_proj", "down_proj")
-        ):
+        elif _is_expert_module_candidate(name, module):
             GGUFExperts._source_module_contract(module)
             GGUFExperts._validate_supported_experts_implementation(
                 getattr(module.config, "_experts_implementation", None)
@@ -728,9 +721,7 @@ def replace_with_gguf_modules(model, compute_dtype=None):
             continue
         if isinstance(module, GGUFLinear | GGUFEmbedding | GGUFExperts):
             continue
-        if (name == "experts" or name.endswith(".experts")) and all(
-            hasattr(module, attribute) for attribute in ("config", "gate_up_proj", "down_proj")
-        ):
+        if _is_expert_module_candidate(name, module):
             replacement = GGUFExperts.from_module(module, compute_dtype=compute_dtype)
         elif isinstance(module, nn.Linear):
             replacement = GGUFLinear.from_linear(module, compute_dtype=compute_dtype)
