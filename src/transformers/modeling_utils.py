@@ -1993,10 +1993,10 @@ class PreTrainedModel(
         return applicable_attention
 
     def _validate_experts_implementation_module_capabilities(
-        self, requested_experts: str | None, config: PreTrainedConfig
+        self, requested_experts: str | None, config: PreTrainedConfig | None = None
     ) -> None:
         for module in self.modules():
-            if getattr(module, "config", None) is not config:
+            if config is not None and getattr(module, "config", None) is not config:
                 continue
             validator = getattr(module, "_validate_supported_experts_implementation", None)
             if callable(validator):
@@ -2233,10 +2233,7 @@ class PreTrainedModel(
                     sub_implementation = experts_implementation.get(subconfig_key, subconfig._experts_implementation)
                     self._validate_experts_implementation_module_capabilities(sub_implementation, subconfig)
         else:
-            for module in self.modules():
-                validator = getattr(module, "_validate_supported_experts_implementation", None)
-                if callable(validator):
-                    validator(requested_implementation)
+            self._validate_experts_implementation_module_capabilities(requested_implementation)
 
         # MegaMoE is locked at load time: its TP plan is baked into `base_model_tp_plan` by `update_tp_plan` (and isn't
         # re-evaluated) and `setup_megamoe_weights` mutates the expert weights into UTCCP layout on first forward.

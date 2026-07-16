@@ -3193,8 +3193,141 @@ class TestAttentionImplementation(unittest.TestCase):
         )
         # With a wrong _experts_implementation, it should raise a proper exception
         experts_module.config._experts_implementation = "foobar"
-        with self.assertRaisesRegex(KeyError, "`foobar` is not a valid experts implementation registered"):
+        with self.assertRaisesRegex(ValueError, "'foobar' is not supported by ExpertsInterface"):
             _ = experts_module(hidden_states, dummy_indices, dummy_scores)
+
+    def test_shared_expert_projection_provider_matches_eager(self):
+        from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
+        from transformers.models.qwen2_moe import Qwen2MoeConfig
+        from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeExperts
+
+        config = Qwen2MoeConfig(
+            hidden_size=8,
+            moe_intermediate_size=16,
+            num_experts=4,
+            num_experts_per_tok=2,
+        )
+        experts = Qwen2MoeExperts(config)
+        experts.requires_grad_(False)
+        torch.manual_seed(0)
+        with torch.no_grad():
+            experts.gate_up_proj.copy_(torch.randn_like(experts.gate_up_proj))
+            experts.down_proj.copy_(torch.randn_like(experts.down_proj))
+
+        self.assertEqual(
+            experts.supported_experts_implementations,
+            ALL_EXPERTS_FUNCTIONS.supported_implementations(),
+        )
+        self.assertTrue(experts.experts_implementation_switchable)
+        self.assertEqual(set(experts._get_expert_projection_tensors()), {"gate_up", "down"})
+        with patch.dict(ALL_EXPERTS_FUNCTIONS._global_mapping, {}, clear=False):
+            ALL_EXPERTS_FUNCTIONS.register("custom_experts", lambda *args, **kwargs: None)
+            self.assertIn("custom_experts", experts.supported_experts_implementations)
+            experts._validate_supported_experts_implementation("custom_experts")
+
+        hidden_states = torch.randn(3, 8)
+        top_k_index = torch.tensor([[0, 1], [2, 1], [0, 2]])
+        top_k_weights = torch.tensor([[0.7, 0.3], [0.4, 0.6], [0.2, 0.8]])
+        grad_output = torch.randn_like(hidden_states)
+        results = {}
+        for implementation in ("eager", "grouped_mm", "batched_mm"):
+            experts.config._experts_implementation_internal = implementation
+            inputs = hidden_states.detach().clone().requires_grad_(True)
+            routing_weights = top_k_weights.detach().clone().requires_grad_(True)
+            output = experts(inputs, top_k_index, routing_weights)
+            output.backward(grad_output)
+            assert inputs.grad is not None and routing_weights.grad is not None
+            results[implementation] = (output.detach(), inputs.grad.detach(), routing_weights.grad.detach())
+
+        for implementation in ("grouped_mm", "batched_mm"):
+            with self.subTest(implementation=implementation):
+                for actual, expected in zip(results[implementation], results["eager"]):
+                    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+        sentinel_indices = top_k_index.clone()
+        sentinel_indices[0, 1] = experts.num_experts
+        sentinel_weights = top_k_weights.clone()
+        sentinel_weights[0, 1] = 0
+        experts.config._experts_implementation_internal = "eager"
+        reference_inputs = hidden_states.detach().clone().requires_grad_(True)
+        reference_output = experts(
+            reference_inputs, sentinel_indices.clamp_max(experts.num_experts - 1), sentinel_weights
+        )
+        reference_output.backward(grad_output)
+        assert reference_inputs.grad is not None
+
+        for implementation in ("grouped_mm", "batched_mm"):
+            with self.subTest(implementation=implementation, expert_parallel_sentinel=True):
+                experts.config._experts_implementation_internal = implementation
+                inputs = hidden_states.detach().clone().requires_grad_(True)
+                output = experts(inputs, sentinel_indices, sentinel_weights)
+                output.backward(grad_output)
+                assert inputs.grad is not None
+                torch.testing.assert_close(output, reference_output, rtol=1e-5, atol=1e-5)
+                torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=1e-5, atol=1e-5)
+
+    def test_shared_expert_projection_provider_layout_gradient_parity(self):
+        from types import SimpleNamespace
+
+        from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
+        from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHExperts
+        from transformers.models.openai_privacy_filter.modeling_openai_privacy_filter import (
+            OpenAIPrivacyFilterExperts,
+        )
+
+        experts_by_layout = {
+            "interleaved_transposed_biased": GptOssExperts(
+                SimpleNamespace(
+                    _experts_implementation="eager",
+                    intermediate_size=4,
+                    num_local_experts=4,
+                    hidden_size=8,
+                )
+            ),
+            "ungated": NemotronHExperts(
+                SimpleNamespace(
+                    _experts_implementation="eager",
+                    n_routed_experts=4,
+                    hidden_size=8,
+                    moe_intermediate_size=4,
+                    moe_latent_size=None,
+                    mlp_hidden_act="relu2",
+                )
+            ),
+            "concatenated_transposed_biased": OpenAIPrivacyFilterExperts(
+                SimpleNamespace(
+                    _experts_implementation="eager",
+                    intermediate_size=4,
+                    num_local_experts=4,
+                    hidden_size=8,
+                )
+            ),
+        }
+        torch.manual_seed(0)
+        hidden_states = torch.randn(3, 8)
+        top_k_index = torch.tensor([[0, 1], [2, 1], [0, 2]])
+        top_k_weights = torch.tensor([[0.7, 0.3], [0.4, 0.6], [0.2, 0.8]])
+        grad_output = torch.randn_like(hidden_states)
+
+        for layout, experts in experts_by_layout.items():
+            for parameter in experts.parameters():
+                with torch.no_grad():
+                    parameter.copy_(torch.randn_like(parameter))
+            experts.requires_grad_(False)
+            results = {}
+            for implementation in ("eager", "grouped_mm", "batched_mm"):
+                experts.config._experts_implementation = implementation
+                inputs = hidden_states.detach().clone().requires_grad_(True)
+                routing_weights = top_k_weights.detach().clone().requires_grad_(True)
+                output = experts(inputs, top_k_index, routing_weights)
+                output.backward(grad_output)
+                assert inputs.grad is not None and routing_weights.grad is not None
+                results[implementation] = (output.detach(), inputs.grad.detach(), routing_weights.grad.detach())
+
+            for implementation in ("grouped_mm", "batched_mm"):
+                with self.subTest(layout=layout, implementation=implementation):
+                    for actual, expected in zip(results[implementation], results["eager"]):
+                        torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
 
     def test_can_set_attn_returns_false_when_module_missing(self):
         # Simulate the "module cleared from sys.modules" case (test cleanup, REPL).
