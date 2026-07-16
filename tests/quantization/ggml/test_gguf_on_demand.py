@@ -15,6 +15,7 @@
 import copy
 import tempfile
 import unittest
+from typing import Any
 
 from transformers import GGUFConfig
 from transformers.testing_utils import require_gguf, require_torch
@@ -25,9 +26,10 @@ if is_torch_available():
     import torch
     from torch.nn import functional as F
 
-    from transformers.integrations.gguf import GGUFEmbedding, GGUFLinear
+    from transformers.integrations.gguf import GGUFEmbedding, GGUFExperts, GGUFLinear
     from transformers.integrations.gguf_dequant import GGUFQuantizedTensor, dequantize_gguf_tensor
     from transformers.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
+    from transformers.models.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM
     from transformers.quantizers.quantizer_gguf import GGUFQuantizer
 
 if is_gguf_available():
@@ -192,6 +194,18 @@ class GGUFOnDemandTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "GGUFEmbedding weight has not been loaded"):
             embedding(torch.tensor([0, 2]))
 
+        config = Qwen3MoeConfig(
+            hidden_size=4,
+            moe_intermediate_size=4,
+            num_experts=2,
+            num_experts_per_tok=1,
+            hidden_act="silu",
+        )
+        experts = GGUFExperts(config)
+        experts.config._experts_implementation_internal = "eager"
+        with self.assertRaisesRegex(RuntimeError, "GGUFExperts weights have not been loaded"):
+            experts(torch.randn(2, 4), torch.tensor([[0], [1]]), torch.ones(2, 1))
+
     def test_gguf_module_factories_preserve_structure_and_meta_device(self):
         source_linear = torch.nn.Linear(4, 3, bias=True, device="meta", dtype=torch.bfloat16)
         linear = GGUFLinear.from_linear(source_linear, compute_dtype=torch.float32)
@@ -254,6 +268,10 @@ class GGUFOnDemandTests(unittest.TestCase):
             self.assertEqual(module.embedding.weight.quant_type, gguf.GGMLQuantizationType.F32)
 
     def test_gguf_modules_use_explicit_compute_dtype(self):
+        from unittest.mock import patch
+
+        from transformers.integrations.gguf import _dequantize_experts
+
         full_weight = torch.arange(32, dtype=torch.float32).reshape(8, 4) / 32
         compressed = GGUFQuantizedTensor(
             torch.from_numpy(_float_bytes(full_weight)),
@@ -267,15 +285,38 @@ class GGUFOnDemandTests(unittest.TestCase):
         embedding = GGUFEmbedding(8, 4, compute_dtype=torch.float32)
         embedding.weight = compressed
 
+        config = Qwen3MoeConfig(
+            hidden_size=4,
+            moe_intermediate_size=4,
+            num_experts=2,
+            num_experts_per_tok=1,
+            hidden_act="silu",
+        )
+        experts = GGUFExperts(config, compute_dtype=torch.float32)
+        expert_weight = torch.arange(32, dtype=torch.float32).reshape(2, 4, 4) / 32
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            setattr(
+                experts,
+                name,
+                GGUFQuantizedTensor(
+                    torch.from_numpy(_float_bytes(expert_weight)),
+                    quant_type=gguf.GGMLQuantizationType.F32,
+                    logical_shape=expert_weight.shape,
+                ),
+            )
+        experts.config._experts_implementation_internal = "eager"
+
         container = torch.nn.Module()
         container.linear = linear
         container.embedding = embedding
+        container.experts = experts
         container.to(dtype=torch.float64)
 
-        for module in (linear, embedding):
+        for module in (linear, embedding, experts):
             self.assertEqual(module.compute_dtype, torch.float64)
         self.assertEqual(linear.weight.dtype, torch.uint8)
         self.assertEqual(embedding.weight.dtype, torch.uint8)
+        self.assertEqual(experts.gate_proj.dtype, torch.uint8)
         self.assertEqual(linear.bias.dtype, torch.float64)
 
         inputs = torch.randn(2, 4, dtype=torch.float32)
@@ -288,6 +329,16 @@ class GGUFOnDemandTests(unittest.TestCase):
         embedded = embedding(input_ids)
         self.assertEqual(embedded.dtype, torch.float64)
         torch.testing.assert_close(embedded, F.embedding(input_ids, full_weight.to(torch.float64)))
+
+        hidden_states = torch.randn(3, 4, dtype=torch.float32)
+        top_k_index = torch.tensor([[0], [1], [0]])
+        top_k_weights = torch.ones(3, 1)
+        with patch(
+            "transformers.integrations.gguf._dequantize_experts", wraps=_dequantize_experts
+        ) as dequantize_experts:
+            expert_output = experts(hidden_states, top_k_index, top_k_weights)
+        self.assertEqual(expert_output.dtype, hidden_states.dtype)
+        self.assertTrue(all(call.args[2] == torch.float64 for call in dequantize_experts.call_args_list))
 
         with self.assertRaisesRegex(TypeError, "compute dtype must be a floating-point"):
             linear.set_compute_dtype(torch.int64)
@@ -618,6 +669,125 @@ class GGUFOnDemandTests(unittest.TestCase):
         object.__setattr__(model, "hf_quantizer", quantizer)
         with tempfile.TemporaryDirectory() as tmpdir, self.assertRaisesRegex(ValueError, "not serializable"):
             model.save_pretrained(tmpdir)
+
+    def test_qwen3_moe_expert_backends_match_dense_reference(self):
+        from unittest.mock import patch
+
+        from transformers.integrations.gguf import _dequantize_experts
+
+        config = Qwen3MoeConfig(
+            hidden_size=8,
+            moe_intermediate_size=8,
+            num_experts=5,
+            num_experts_per_tok=2,
+            hidden_act="silu",
+        )
+        module = GGUFExperts(config, compute_dtype=torch.bfloat16)
+        torch.manual_seed(0)
+        full_weights = {
+            "gate_proj": torch.randn(5, 8, 8),
+            "up_proj": torch.randn(5, 8, 8),
+            "down_proj": torch.randn(5, 8, 8),
+        }
+        for name, full_weight in full_weights.items():
+            setattr(
+                module,
+                name,
+                GGUFQuantizedTensor(
+                    torch.from_numpy(_float_bytes(full_weight)),
+                    quant_type=gguf.GGMLQuantizationType.F32,
+                    logical_shape=full_weight.shape,
+                ),
+            )
+
+        hidden_states = torch.randn(4, 8)
+        top_k_index = torch.tensor([[0, 1], [2, 1], [0, 2], [1, 1]])
+        top_k_weights = torch.tensor([[0.7, 0.3], [0.4, 0.6], [0.2, 0.8], [0.55, 0.45]])
+        expected = torch.zeros_like(hidden_states, dtype=module.compute_dtype)
+        for token_idx in range(hidden_states.shape[0]):
+            for top_k_pos in range(top_k_index.shape[1]):
+                expert_idx = top_k_index[token_idx, top_k_pos]
+                current_state = hidden_states[token_idx].to(module.compute_dtype)
+                gate = F.linear(current_state, full_weights["gate_proj"][expert_idx].to(module.compute_dtype))
+                up = F.linear(current_state, full_weights["up_proj"][expert_idx].to(module.compute_dtype))
+                output = F.linear(F.silu(gate) * up, full_weights["down_proj"][expert_idx].to(module.compute_dtype))
+                expected[token_idx] += output * top_k_weights[token_idx, top_k_pos].to(module.compute_dtype)
+        expected = expected.to(hidden_states.dtype)
+
+        for implementation in ("eager", "grouped_mm", "batched_mm"):
+            module.config._experts_implementation_internal = implementation
+            inputs = hidden_states.detach().clone().requires_grad_(True)
+            with patch(
+                "transformers.integrations.gguf._dequantize_experts", wraps=_dequantize_experts
+            ) as dequantize_experts:
+                actual = module(inputs, top_k_index, top_k_weights)
+            torch.testing.assert_close(actual, expected, rtol=5e-3, atol=0.1)
+            dequantized_expert_ids = {
+                int(expert_id)
+                for call in dequantize_experts.call_args_list
+                for expert_id in call.args[1].detach().cpu().tolist()
+            }
+            self.assertEqual(dequantized_expert_ids, {0, 1, 2})
+            self.assertTrue(all(call.args[2] == module.compute_dtype for call in dequantize_experts.call_args_list))
+            actual.sum().backward()
+            self.assertIsNotNone(inputs.grad)
+
+        self.assertEqual(dict(module.named_buffers()), {})
+        self.assertEqual(set(dict(module.named_parameters())), {"gate_proj", "up_proj", "down_proj"})
+        self.assertTrue(all(not param.requires_grad for param in module.parameters()))
+
+    def test_qwen3_moe_replacement_and_converter_rewrite(self):
+        from transformers.core_model_loading import WeightRenaming
+        from transformers.modeling_gguf_pytorch_utils import get_gguf_converters
+
+        config = Qwen3MoeConfig(
+            vocab_size=8,
+            hidden_size=8,
+            intermediate_size=16,
+            moe_intermediate_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_experts=4,
+            num_experts_per_tok=2,
+        )
+        with torch.device("meta"):
+            model = Qwen3MoeForCausalLM(config)
+        weight_mapping = get_gguf_converters("qwen3_moe")
+        quantizer = GGUFQuantizer(GGUFConfig(architecture="qwen3_moe"), weight_mapping=weight_mapping)
+        quantizer.update_dtype(torch.bfloat16)
+        checkpoint_tensors = {
+            "blk.0.ffn_gate_exps.weight": GGUFQuantizedTensor(
+                torch.empty((4, 4, 2), dtype=torch.uint8),
+                quant_type=gguf.GGMLQuantizationType.Q5_K,
+                logical_shape=(4, 4, 8),
+            )
+        }
+        quantizer.set_weight_mapping(weight_mapping, checkpoint_tensors)
+        quantizer.preprocess_model(model, dtype=torch.float32, device_map={"": "cpu"})
+        experts: Any = model.get_submodule("model.layers.0.mlp.experts")
+        self.assertIsInstance(experts, GGUFExperts)
+        self.assertFalse(hasattr(experts, "gate_up_proj"))
+        self.assertEqual(experts.gate_proj.device.type, "meta")
+        self.assertEqual(experts.compute_dtype, torch.bfloat16)
+
+        conversions = quantizer.update_weight_conversions([])
+        renamings = {
+            source: rule.target_patterns[0]
+            for rule in conversions
+            if isinstance(rule, WeightRenaming)
+            for source in rule.source_patterns
+        }
+        self.assertEqual(renamings[r"\.ffn_gate_exps\.weight"], ".mlp.experts.gate_proj")
+        self.assertEqual(renamings[r"\.ffn_up_exps\.weight"], ".mlp.experts.up_proj")
+
+        gate_name = "model.layers.0.mlp.experts.gate_proj"
+        self.assertEqual(quantizer.param_storage_bytes[gate_name], 32)
+        self.assertEqual(quantizer.param_element_size(model, gate_name, experts.gate_proj), 0.25)
+
+        model.config._experts_implementation_internal = "deepgemm"
+        with self.assertRaisesRegex(ValueError, "GGUF experts do not support 'deepgemm'"):
+            quantizer.preprocess_model(model, dtype=torch.float32, device_map={"": "cpu"})
 
 
 if __name__ == "__main__":

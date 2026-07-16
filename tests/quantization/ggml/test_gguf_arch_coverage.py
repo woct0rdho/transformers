@@ -99,6 +99,15 @@ class GgufArchCoverageTests(unittest.TestCase):
                         f"{model_type}: Q/K weights must not receive Llama-style permutation.",
                     )
 
+    def test_qwen3_moe_qk_norms_are_renamed(self):
+        rules = get_gguf_converters("qwen3_moe")
+        for projection in ("q", "k"):
+            key = f"blk.0.attn_{projection}_norm.weight"
+            for rule in rules:
+                if isinstance(rule, WeightRenaming):
+                    key, _ = rule.rename_source_key(key)
+            self.assertEqual(key, f"model.layers.0.self_attn.{projection}_norm.weight")
+
     def test_quantizer_prepends_gguf_dequantize_to_every_converter(self):
         """``GGUFQuantizer.update_weight_conversions`` injects ``GGUFDequantize`` at the head
         of every ``WeightConverter`` op chain — same pattern as ``Fp8Quantizer``.

@@ -29,7 +29,7 @@ logger = logging.get_logger(__name__)
 
 
 class GGUFQuantizer(HfQuantizer):
-    """Load GGUF checkpoints persistently for dense Qwen3 or dequantize as a compatibility fallback."""
+    """Keep Qwen3 GGUF checkpoints compressed or dequantize through the compatibility fallback."""
 
     requires_calibration = False
     quantization_config: GGUFConfig
@@ -41,7 +41,7 @@ class GGUFQuantizer(HfQuantizer):
             quantization_config = GGUFConfig()
         kwargs.setdefault("pre_quantized", True)
         super().__init__(quantization_config=quantization_config, **kwargs)
-        self.persistent = quantization_config.architecture == "qwen3"
+        self.persistent = quantization_config.architecture in {"qwen3", "qwen3_moe"}
         self.compute_dtype = None
         self.weight_mapping = list(weight_mapping or [])
         self.checkpoint_storage_bytes = {}
@@ -54,7 +54,7 @@ class GGUFQuantizer(HfQuantizer):
     def validate_environment(self, *args, **kwargs):
         if self.quantization_config.architecture and not self.persistent:
             logger.warning_once(
-                f"Persistent GGUF weights currently support dense Qwen3 only; "
+                f"Persistent GGUF weights currently support Qwen3 and Qwen3-MoE only; "
                 f"{self.quantization_config.architecture!r} will use load-time dequantization."
             )
 
@@ -87,6 +87,19 @@ class GGUFQuantizer(HfQuantizer):
                 injected.append(conversion)
                 continue
 
+            sources = conversion._original_source_patterns
+            if self.quantization_config.architecture == "qwen3_moe" and sources == [
+                r"\.ffn_gate_exps\.weight",
+                r"\.ffn_up_exps\.weight",
+            ]:
+                injected.extend(
+                    [
+                        WeightRenaming(sources[0], ".mlp.experts.gate_proj"),
+                        WeightRenaming(sources[1], ".mlp.experts.up_proj"),
+                    ]
+                )
+                continue
+
             if self.persistent:
                 operations = [GGUFSetMetadata(), *conversion.operations]
             else:
@@ -94,7 +107,7 @@ class GGUFQuantizer(HfQuantizer):
 
             injected.append(
                 WeightConverter(
-                    source_patterns=conversion._original_source_patterns,
+                    source_patterns=sources,
                     target_patterns=conversion._original_target_patterns,
                     operations=operations,
                 )
@@ -127,6 +140,16 @@ class GGUFQuantizer(HfQuantizer):
 
     def _process_model_before_weight_loading(self, model, **kwargs):
         if self.persistent:
+            if self.quantization_config.architecture == "qwen3_moe" and model.config._experts_implementation not in {
+                "eager",
+                "grouped_mm",
+                "batched_mm",
+            }:
+                raise ValueError(
+                    f"GGUF experts do not support {model.config._experts_implementation!r}; "
+                    "use 'eager', 'grouped_mm', or 'batched_mm'."
+                )
+
             from ..integrations.gguf import replace_with_gguf_modules
             from ..utils import is_torch_available
 

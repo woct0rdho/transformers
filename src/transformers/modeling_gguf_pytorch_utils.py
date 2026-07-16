@@ -294,6 +294,9 @@ if is_torch_available():
             operations=[Concatenate(dim=1)],
         ),
     ]
+    _QWEN3_MOE_CONVERTERS = _QWEN2_MOE_CONVERTERS + [
+        WeightRenaming(r"\.attn_(q|k)_norm\.weight", r".self_attn.\1_norm.weight"),
+    ]
 
     # --- Bloom -----------------------------------------------------------------
     _BLOOM_CONVERTERS = [
@@ -407,7 +410,7 @@ if is_torch_available():
         "starcoder2": _STARCODER2_CONVERTERS,
         # MoE
         "qwen2_moe": _QWEN2_MOE_CONVERTERS,
-        "qwen3_moe": _QWEN2_MOE_CONVERTERS,
+        "qwen3_moe": _QWEN3_MOE_CONVERTERS,
         "minimax_m2": _MINIMAX_M2_CONVERTERS,
         "gpt_oss": _GPT_OSS_CONVERTERS,
         # T5 / UMT5 / T5-encoder share the same encoder–decoder mapping

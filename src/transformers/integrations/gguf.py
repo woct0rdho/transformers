@@ -21,6 +21,7 @@ from torch.nn import functional as F
 
 from ..utils.generic import maybe_autocast
 from .gguf_dequant import GGUFQuantizedTensor, dequantize_gguf_tensor
+from .moe import ExpertsInterface, _batched_linear, _grouped_linear, use_experts_implementation
 
 
 def _dequantize_weight(weight: GGUFQuantizedTensor, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -32,6 +33,25 @@ def _dequantize_rows(weight: GGUFQuantizedTensor, rows: torch.Tensor, dtype, dev
     rows = rows.to(payload.device)
     selected = payload.index_select(0, rows)
     return dequantize_gguf_tensor(selected, weight.quant_type, dtype=dtype, device=device)
+
+
+def _dequantize_experts(weight: torch.Tensor, expert_indices: torch.Tensor, dtype, device):
+    if not isinstance(weight, GGUFQuantizedTensor):
+        return weight.index_select(0, expert_indices.to(weight.device)).to(device=device, dtype=dtype)
+    return _dequantize_rows(weight, expert_indices, dtype, device)
+
+
+def _validate_expert_weights(module: nn.Module):
+    if not all(
+        isinstance(weight, GGUFQuantizedTensor) or weight.is_floating_point()
+        for weight in (module.gate_proj, module.up_proj, module.down_proj)
+    ):
+        raise RuntimeError("GGUFExperts weights have not been loaded with packed or floating-point parameters")
+
+
+def _validate_expert_indices(expert_indices: torch.Tensor, num_experts: int):
+    if torch.any((expert_indices < 0) | (expert_indices >= num_experts)):
+        raise IndexError("GGUF experts do not support expert-parallel sentinel indices")
 
 
 class _GGUFLinearFunction(torch.autograd.Function):
@@ -98,6 +118,172 @@ class _GGUFComputeDtypeMixin:
         if compute_probe.dtype.is_floating_point:
             self.compute_dtype = compute_probe.dtype
         return module
+
+
+def gguf_batched_mm_experts_forward(
+    self: nn.Module,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    _validate_expert_weights(self)
+    input_dtype = hidden_states.dtype
+    num_top_k = top_k_index.size(-1)
+    num_tokens = hidden_states.size(0)
+    expert_ids = top_k_index.reshape(-1)
+    _validate_expert_indices(expert_ids, self.num_experts)
+
+    selected_hidden_states = hidden_states.to(self.compute_dtype).repeat_interleave(num_top_k, dim=0)
+    active_experts, local_expert_ids = torch.unique(expert_ids, sorted=True, return_inverse=True)
+
+    gate_weights = _dequantize_experts(
+        self.gate_proj, active_experts, self.compute_dtype, hidden_states.device
+    ).index_select(0, local_expert_ids)
+    gate = _batched_linear(selected_hidden_states, gate_weights)
+    del gate_weights
+
+    up_weights = _dequantize_experts(
+        self.up_proj, active_experts, self.compute_dtype, hidden_states.device
+    ).index_select(0, local_expert_ids)
+    up = _batched_linear(selected_hidden_states, up_weights)
+    del up_weights
+
+    intermediate = self.act_fn(gate) * up
+    down_weights = _dequantize_experts(
+        self.down_proj, active_experts, self.compute_dtype, hidden_states.device
+    ).index_select(0, local_expert_ids)
+    output = _batched_linear(intermediate, down_weights)
+    output = output * top_k_weights.reshape(-1, 1).to(output.dtype)
+    return output.view(num_tokens, num_top_k, self.hidden_dim).sum(dim=1).to(input_dtype)
+
+
+def gguf_grouped_mm_experts_forward(
+    self: nn.Module,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    _validate_expert_weights(self)
+    input_dtype = hidden_states.dtype
+    num_top_k = top_k_index.size(-1)
+    num_tokens = hidden_states.size(0)
+    expert_ids = top_k_index.reshape(-1)
+    _validate_expert_indices(expert_ids, self.num_experts)
+
+    sorted_expert_ids, permutation = torch.sort(expert_ids)
+    selected_hidden_states = hidden_states.to(self.compute_dtype)[permutation // num_top_k]
+    selected_routing_weights = top_k_weights.reshape(-1)[permutation]
+    active_experts, expert_counts = torch.unique_consecutive(sorted_expert_ids, return_counts=True)
+    offsets = expert_counts.cumsum(0, dtype=torch.int32)
+
+    gate_weights = _dequantize_experts(self.gate_proj, active_experts, self.compute_dtype, hidden_states.device)
+    gate = _grouped_linear(selected_hidden_states, gate_weights, offsets)
+    del gate_weights
+
+    up_weights = _dequantize_experts(self.up_proj, active_experts, self.compute_dtype, hidden_states.device)
+    up = _grouped_linear(selected_hidden_states, up_weights, offsets)
+    del up_weights
+
+    intermediate = self.act_fn(gate) * up
+    down_weights = _dequantize_experts(self.down_proj, active_experts, self.compute_dtype, hidden_states.device)
+    output = _grouped_linear(intermediate, down_weights, offsets)
+    output = output * selected_routing_weights.unsqueeze(-1).to(output.dtype)
+
+    inverse_permutation = torch.empty_like(permutation)
+    inverse_permutation[permutation] = torch.arange(permutation.size(0), device=permutation.device)
+    output = output[inverse_permutation]
+    return output.view(num_tokens, num_top_k, self.hidden_dim).sum(dim=1).to(input_dtype)
+
+
+class GGUFExpertsInterface(ExpertsInterface):
+    """Switchable MoE implementations that understand compressed GGUF expert parameters."""
+
+    _global_mapping = {
+        "batched_mm": gguf_batched_mm_experts_forward,
+        "grouped_mm": gguf_grouped_mm_experts_forward,
+    }
+
+    def get_interface(self, experts_implementation, default):
+        if experts_implementation not in (None, "eager", *self._global_mapping):
+            raise ValueError(
+                f"GGUF experts do not support {experts_implementation!r}; use 'eager', 'grouped_mm', or 'batched_mm'."
+            )
+        return super().get_interface(experts_implementation, default)
+
+
+ALL_GGUF_EXPERTS_FUNCTIONS = GGUFExpertsInterface()
+
+
+@use_experts_implementation(experts_interface=ALL_GGUF_EXPERTS_FUNCTIONS)
+class GGUFExperts(_GGUFComputeDtypeMixin, nn.Module):
+    """Routed experts backed by separate compressed GGUF gate, up, and down payloads."""
+
+    def __init__(self, config, device=None, compute_dtype=None):
+        super().__init__()
+        from ..activations import ACT2FN
+
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.set_compute_dtype(compute_dtype or torch.get_default_dtype())
+        self.gate_proj = nn.Parameter(
+            torch.empty((self.num_experts, self.intermediate_dim, self.hidden_dim), dtype=torch.uint8, device=device),
+            requires_grad=False,
+        )
+        self.up_proj = nn.Parameter(
+            torch.empty((self.num_experts, self.intermediate_dim, self.hidden_dim), dtype=torch.uint8, device=device),
+            requires_grad=False,
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty((self.num_experts, self.hidden_dim, self.intermediate_dim), dtype=torch.uint8, device=device),
+            requires_grad=False,
+        )
+
+    @classmethod
+    def from_module(cls, module: nn.Module, compute_dtype=None):
+        replacement = cls(module.config, device=module.gate_up_proj.device, compute_dtype=compute_dtype)
+        replacement.act_fn = module.act_fn
+        return replacement
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        _validate_expert_weights(self)
+        _validate_expert_indices(top_k_index, self.num_experts)
+        compute_hidden_states = hidden_states.to(self.compute_dtype)
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+            active_experts = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero(as_tuple=False).view(-1)
+
+        for expert_idx in active_experts:
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = compute_hidden_states[token_idx]
+            expert = expert_idx.reshape(1)
+
+            gate_weight = _dequantize_experts(
+                self.gate_proj, expert, self.compute_dtype, hidden_states.device
+            ).squeeze(0)
+            gate = F.linear(current_state, gate_weight)
+            del gate_weight
+
+            up_weight = _dequantize_experts(self.up_proj, expert, self.compute_dtype, hidden_states.device).squeeze(0)
+            up = F.linear(current_state, up_weight)
+            del up_weight
+
+            intermediate = self.act_fn(gate) * up
+            down_weight = _dequantize_experts(
+                self.down_proj, expert, self.compute_dtype, hidden_states.device
+            ).squeeze(0)
+            output = F.linear(intermediate, down_weight)
+            output = output * top_k_weights[token_idx, top_k_pos, None].to(output.dtype)
+            final_hidden_states.index_add_(0, token_idx, output.to(final_hidden_states.dtype))
+
+        return final_hidden_states
 
 
 class GGUFLinear(_GGUFComputeDtypeMixin, nn.Linear):
@@ -244,13 +430,17 @@ class GGUFEmbedding(_GGUFComputeDtypeMixin, nn.Embedding):
 
 
 def replace_with_gguf_modules(model, compute_dtype=None):
-    """Replace dense Qwen3 linear and embedding modules in a meta-initialized model."""
+    """Replace Qwen3 linear, embedding, and routed-expert modules on the meta model."""
     for name, module in list(model.named_modules()):
         if not name:
             continue
-        if isinstance(module, GGUFLinear | GGUFEmbedding):
+        if isinstance(module, GGUFLinear | GGUFEmbedding | GGUFExperts):
             continue
-        if isinstance(module, nn.Linear):
+        if name.endswith(".experts") and all(
+            hasattr(module, attribute) for attribute in ("config", "gate_up_proj", "down_proj")
+        ):
+            replacement = GGUFExperts.from_module(module, compute_dtype=compute_dtype)
+        elif isinstance(module, nn.Linear):
             replacement = GGUFLinear.from_linear(module, compute_dtype=compute_dtype)
         elif isinstance(module, nn.Embedding):
             replacement = GGUFEmbedding.from_embedding(module, compute_dtype=compute_dtype)
