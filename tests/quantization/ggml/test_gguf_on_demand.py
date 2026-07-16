@@ -20,7 +20,12 @@ from typing import Any
 
 from transformers import GGUFConfig
 from transformers.testing_utils import require_gguf, require_torch, require_torch_bf16, require_torch_gpu, torch_device
-from transformers.utils import is_gguf_available, is_torch_available
+from transformers.utils import (
+    is_causal_conv1d_available,
+    is_flash_linear_attention_available,
+    is_gguf_available,
+    is_torch_available,
+)
 
 
 if is_torch_available():
@@ -37,6 +42,7 @@ if is_torch_available():
     from transformers.integrations.gguf_dequant import GGUFQuantizedTensor, dequantize_gguf_tensor
     from transformers.integrations.moe import use_experts_implementation
     from transformers.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
+    from transformers.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5TextConfig
     from transformers.models.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM
     from transformers.quantizers.quantizer_gguf import GGUFQuantizer
 
@@ -846,6 +852,144 @@ class GGUFOnDemandTests(unittest.TestCase):
         generated = model.generate(input_ids, max_new_tokens=2, do_sample=False)
         self.assertEqual(generated.shape, (1, input_ids.shape[1] + 2))
 
+    @unittest.skipIf(
+        is_causal_conv1d_available() or is_flash_linear_attention_available(),
+        "CPU fallback test requires the optional accelerator implementations to be unavailable",
+    )
+    def test_tiny_qwen35_forward_generation_and_layout_replacement(self):
+        torch.manual_seed(0)
+        config = Qwen3_5TextConfig(
+            vocab_size=32,
+            hidden_size=24,
+            intermediate_size=48,
+            num_hidden_layers=2,
+            num_attention_heads=3,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=32,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=2,
+            linear_num_value_heads=6,
+            layer_types=["linear_attention", "full_attention"],
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 10000.0,
+                "partial_rotary_factor": 0.5,
+                "mrope_section": [1, 1, 0],
+                "mrope_interleaved": True,
+            },
+            tie_word_embeddings=True,
+            bos_token_id=0,
+            eos_token_id=1,
+            pad_token_id=0,
+        )
+        model = Qwen3_5ForCausalLM(config).eval()
+        input_ids = torch.tensor([[2, 5, 7, 3]])
+        with torch.no_grad():
+            expected_logits = model(input_ids).logits
+
+        source_weights = {
+            f"{name}.weight": module.weight.detach().clone()
+            for name, module in model.named_modules()
+            if isinstance(module, (torch.nn.Linear, torch.nn.Embedding))
+        }
+
+        from transformers.modeling_gguf_pytorch_utils import get_gguf_converters
+
+        weight_mapping = get_gguf_converters("qwen3_5_text")
+        quantizer = GGUFQuantizer(
+            GGUFConfig(architecture="qwen3_5_text"),
+            weight_mapping=weight_mapping,
+        )
+        quantizer.set_weight_mapping(
+            weight_mapping,
+            {
+                "blk.0.ssm_alpha.weight": torch.empty(6, 24, dtype=torch.float16),
+                "blk.0.ssm_beta.weight": torch.empty(6, 24, dtype=torch.float16),
+            },
+        )
+        quantizer.update_dtype(torch.float32)
+        quantizer.preprocess_model(model, dtype=torch.float32, device_map={"": "cpu"})
+
+        linear_attn = model.model.layers[0].linear_attn
+        self.assertEqual(linear_attn.in_proj_a.weight.dtype, torch.float32)
+        self.assertEqual(linear_attn.in_proj_b.weight.dtype, torch.float32)
+        self.assertEqual(linear_attn.in_proj_qkv.weight.dtype, torch.uint8)
+        value_heads_per_key = linear_attn.num_v_heads // linear_attn.num_k_heads
+
+        def physical_order(head_dim):
+            return (
+                torch.arange(linear_attn.num_v_heads * head_dim)
+                .reshape(linear_attn.num_k_heads, value_heads_per_key, head_dim)
+                .transpose(0, 1)
+                .reshape(-1)
+            )
+
+        for name, module in model.named_modules():
+            if not isinstance(module, (GGUFLinear, GGUFEmbedding)):
+                continue
+            full_weight = source_weights[f"{name}.weight"]
+            physical_weight = full_weight.clone()
+            if name.endswith("linear_attn.in_proj_qkv"):
+                value_offset = 2 * linear_attn.key_dim
+                physical_weight[value_offset:] = full_weight[value_offset:].index_select(
+                    0, physical_order(linear_attn.head_v_dim)
+                )
+            elif name.endswith(("linear_attn.in_proj_z", "linear_attn.in_proj_a", "linear_attn.in_proj_b")):
+                head_dim = 1 if name.endswith(("in_proj_a", "in_proj_b")) else linear_attn.head_v_dim
+                physical_weight = full_weight.index_select(0, physical_order(head_dim))
+            elif name.endswith("linear_attn.out_proj"):
+                physical_weight = full_weight.index_select(1, physical_order(linear_attn.head_v_dim))
+
+            if name.endswith(("linear_attn.in_proj_a", "linear_attn.in_proj_b")):
+                module.weight = torch.nn.Parameter(physical_weight, requires_grad=False)
+            else:
+                module.weight = GGUFQuantizedTensor(
+                    torch.from_numpy(_float_bytes(physical_weight)),
+                    quant_type=gguf.GGMLQuantizationType.F32,
+                    logical_shape=physical_weight.shape,
+                )
+        model.tie_weights()
+
+        self.assertIsNotNone(model.model.layers[0].linear_attn.in_proj_qkv.output_permutation)
+        self.assertEqual(
+            model.model.layers[0].linear_attn.in_proj_qkv.output_permutation_offset,
+            2 * linear_attn.key_dim,
+        )
+        self.assertIsNotNone(model.model.layers[0].linear_attn.out_proj.input_permutation)
+        self.assertIsNone(model.model.layers[1].self_attn.q_proj.output_permutation)
+
+        with torch.no_grad():
+            actual_logits = model(input_ids).logits
+            prefill = model(input_ids[:, :2], use_cache=True)
+            step = model(input_ids[:, 2:3], past_key_values=prefill.past_key_values, use_cache=True)
+            final_step = model(input_ids[:, 3:], past_key_values=step.past_key_values, use_cache=True)
+            chunk_prefill = model(input_ids[:, :1], use_cache=True)
+            chunk = model(input_ids[:, 1:], past_key_values=chunk_prefill.past_key_values, use_cache=True)
+        torch.testing.assert_close(actual_logits, expected_logits, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(step.logits[:, -1], expected_logits[:, 2], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(final_step.logits[:, -1], expected_logits[:, 3], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(chunk.logits, expected_logits[:, 1:], rtol=1e-5, atol=1e-6)
+
+        generated = model.generate(input_ids, max_new_tokens=2, do_sample=False)
+        self.assertEqual(generated.shape, (1, input_ids.shape[1] + 2))
+
+        model.gradient_checkpointing_enable()
+        model.train()
+        input_embeds = torch.randn(1, 3, config.hidden_size, requires_grad=True)
+        model(inputs_embeds=input_embeds, use_cache=False).logits.float().square().mean().backward()
+        self.assertIsNotNone(input_embeds.grad)
+        self.assertTrue(torch.isfinite(input_embeds.grad).all())
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for parameter in model.parameters()
+                if isinstance(parameter, GGUFQuantizedTensor)
+            )
+        )
+
     def test_qwen3_module_sizing_uses_physical_checkpoint_storage(self):
         from transformers.integrations.accelerate import compute_module_sizes
         from transformers.modeling_gguf_pytorch_utils import get_gguf_converters
@@ -1268,6 +1412,18 @@ class GGUFOnDemandTests(unittest.TestCase):
         }
         self.assertEqual(renamings[r"\.ffn_gate_exps\.weight"], ".mlp.experts.gate_proj")
         self.assertEqual(renamings[r"\.ffn_up_exps\.weight"], ".mlp.experts.up_proj")
+
+        other_persistent_quantizer = GGUFQuantizer(
+            GGUFConfig(architecture="qwen3_5_text"), weight_mapping=weight_mapping
+        )
+        other_renamings = {
+            source: rule.target_patterns[0]
+            for rule in other_persistent_quantizer.update_weight_conversions([])
+            if isinstance(rule, WeightRenaming)
+            for source in rule.source_patterns
+        }
+        self.assertEqual(other_renamings[r"\.ffn_gate_exps\.weight"], ".mlp.experts.gate_proj")
+        self.assertEqual(other_renamings[r"\.ffn_up_exps\.weight"], ".mlp.experts.up_proj")
 
         gate_name = "model.layers.0.mlp.experts.gate_proj"
         self.assertEqual(quantizer.param_storage_bytes[gate_name], 32)

@@ -29,7 +29,7 @@ logger = logging.get_logger(__name__)
 
 
 class GGUFQuantizer(HfQuantizer):
-    """Keep Qwen3 GGUF checkpoints compressed or dequantize through the compatibility fallback."""
+    """Keep validated GGUF checkpoints compressed or dequantize through the compatibility fallback."""
 
     requires_calibration = False
     quantization_config: GGUFConfig
@@ -41,11 +41,12 @@ class GGUFQuantizer(HfQuantizer):
             quantization_config = GGUFConfig()
         kwargs.setdefault("pre_quantized", True)
         super().__init__(quantization_config=quantization_config, **kwargs)
-        self.persistent = quantization_config.architecture in {"qwen3", "qwen3_moe"}
+        self.persistent = quantization_config.architecture in {"qwen3", "qwen3_moe", "qwen3_5_text"}
         self.compute_dtype = None
         self.weight_mapping = list(weight_mapping or [])
         self.checkpoint_storage_bytes = {}
         self.param_storage_bytes = {}
+        self.floating_checkpoint_params = set()
 
     def update_dtype(self, dtype):
         self.compute_dtype = dtype
@@ -54,14 +55,24 @@ class GGUFQuantizer(HfQuantizer):
     def validate_environment(self, *args, **kwargs):
         if self.quantization_config.architecture and not self.persistent:
             logger.warning_once(
-                f"Persistent GGUF weights currently support Qwen3 and Qwen3-MoE only; "
+                f"Persistent GGUF weights currently support Qwen3, Qwen3-MoE, and dense Qwen3.5 text models; "
                 f"{self.quantization_config.architecture!r} will use load-time dequantization."
             )
 
     def set_weight_mapping(self, weight_mapping, checkpoint_tensors=None):
+        from ..core_model_loading import WeightConverter, WeightRenaming, rename_source_key
+
         self.weight_mapping = list(weight_mapping or [])
+        checkpoint_tensors = checkpoint_tensors or {}
         self.checkpoint_storage_bytes = {
-            name: tensor.numel() * tensor.element_size() for name, tensor in (checkpoint_tensors or {}).items()
+            name: tensor.numel() * tensor.element_size() for name, tensor in checkpoint_tensors.items()
+        }
+        renamings = [entry for entry in self.weight_mapping if isinstance(entry, WeightRenaming)]
+        converters = [entry for entry in self.weight_mapping if isinstance(entry, WeightConverter)]
+        self.floating_checkpoint_params = {
+            rename_source_key(name, renamings, converters)[0]
+            for name, tensor in checkpoint_tensors.items()
+            if tensor.is_floating_point()
         }
 
     @property
@@ -88,7 +99,7 @@ class GGUFQuantizer(HfQuantizer):
                 continue
 
             sources = conversion._original_source_patterns
-            if self.quantization_config.architecture == "qwen3_moe" and sources == [
+            if self.persistent and sources == [
                 r"\.ffn_gate_exps\.weight",
                 r"\.ffn_up_exps\.weight",
             ]:
@@ -154,7 +165,11 @@ class GGUFQuantizer(HfQuantizer):
                 if uses_rocm and model.config._attn_implementation == "sdpa":
                     logger.warning_once("GGUF on ROCm uses eager attention because SDPA is unstable for this path.")
                     model.config._attn_implementation = "eager"
-            replace_with_gguf_modules(model, compute_dtype=self.compute_dtype)
+            replace_with_gguf_modules(
+                model,
+                compute_dtype=self.compute_dtype,
+                floating_checkpoint_params=self.floating_checkpoint_params,
+            )
         return model
 
     def _process_model_after_weight_loading(self, model, **kwargs):

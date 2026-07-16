@@ -845,8 +845,8 @@ def _validate_qwen35_gated_delta_net(name: str, module: nn.Module):
             raise ValueError(
                 f"Qwen3.5 GGUF recurrent parameter {name}.{parameter_name} must have shape {expected_shape}"
             )
-    norm = getattr(module, "norm", None)
-    if not isinstance(getattr(norm, "weight", None), torch.Tensor) or tuple(norm.weight.shape) != (module.head_v_dim,):
+    norm_weight = getattr(getattr(module, "norm", None), "weight", None)
+    if not isinstance(norm_weight, torch.Tensor) or tuple(norm_weight.shape) != (module.head_v_dim,):
         raise ValueError(f"Qwen3.5 GGUF recurrent norm {name}.norm must have weight shape {(module.head_v_dim,)}")
 
 
