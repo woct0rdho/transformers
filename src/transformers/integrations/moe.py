@@ -520,14 +520,20 @@ def _default_apply_gate(self, gate_up_out: torch.Tensor) -> torch.Tensor:
     return self.act_fn(gate) * up  # (S, intermediate_dim)
 
 
+def _default_apply_split_gate(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """Apply the default gated-MLP operation to separate gate and up projections."""
+    return self.act_fn(gate) * up
+
+
 def use_experts_implementation(
     experts_class: type[torch.nn.Module] | None = None,
     *,
     experts_interface: ExpertsInterface = ALL_EXPERTS_FUNCTIONS,
-    is_concatenated: bool = True,
+    is_concatenated: bool | None = True,
     is_transposed: bool = False,
     has_bias: bool = False,
     has_gate: bool = True,
+    projection_layout: str | None = None,
 ) -> type[torch.nn.Module]:
     """Decorator to modify experts class to support different experts implementations.
 
@@ -546,6 +552,10 @@ def use_experts_implementation(
         has_gate (`bool`, *optional*, defaults to `True`):
             Whether the experts use a gating mechanism or not.
             Whether it has gate_up_proj weights or just up_proj weights.
+        projection_layout (`str`, *optional*):
+            Explicit expert projection layout. Defaults to `"concatenated_gate_up"`, `"interleaved_gate_up"`,
+            or `"up_only"` based on `has_gate` and `is_concatenated`. Packed implementations may define another
+            layout such as `"split_gate_up"`.
 
     Returns:
         `type[torch.nn.Module]`: The modified experts class.
@@ -554,6 +564,16 @@ def use_experts_implementation(
     def wrapper(experts_class: type[torch.nn.Module]) -> type[torch.nn.Module]:
         original_init = experts_class.__init__
         original_forward = experts_class.forward
+        source_apply_gate = getattr(experts_class, "_apply_gate", None)
+        gate_implementation = "default" if source_apply_gate in (None, _default_apply_gate) else "custom"
+        resolved_projection_layout = projection_layout
+        if resolved_projection_layout is None:
+            if not has_gate:
+                resolved_projection_layout = "up_only"
+            elif is_concatenated:
+                resolved_projection_layout = "concatenated_gate_up"
+            else:
+                resolved_projection_layout = "interleaved_gate_up"
 
         @wraps(original_init)
         def __init__(self, config, *args, **kwargs):
@@ -563,6 +583,8 @@ def use_experts_implementation(
             self.has_bias = has_bias
             self.is_transposed = is_transposed
             self.is_concatenated = is_concatenated
+            self.projection_layout = resolved_projection_layout
+            self.gate_implementation = gate_implementation
 
         @wraps(original_forward)
         def forward(self, *args, **kwargs):
@@ -571,6 +593,8 @@ def use_experts_implementation(
 
         if not hasattr(experts_class, "_apply_gate"):
             experts_class._apply_gate = _default_apply_gate
+        if not hasattr(experts_class, "_apply_split_gate"):
+            experts_class._apply_split_gate = _default_apply_split_gate
 
         experts_class.__init__ = __init__
         experts_class.forward = forward

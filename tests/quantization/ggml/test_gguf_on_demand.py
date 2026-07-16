@@ -15,6 +15,7 @@
 import copy
 import tempfile
 import unittest
+from types import SimpleNamespace
 from typing import Any
 
 from transformers import GGUFConfig
@@ -26,8 +27,14 @@ if is_torch_available():
     import torch
     from torch.nn import functional as F
 
-    from transformers.integrations.gguf import GGUFEmbedding, GGUFExperts, GGUFLinear
+    from transformers.integrations.gguf import (
+        GGUFEmbedding,
+        GGUFExperts,
+        GGUFLinear,
+        replace_with_gguf_modules,
+    )
     from transformers.integrations.gguf_dequant import GGUFQuantizedTensor, dequantize_gguf_tensor
+    from transformers.integrations.moe import use_experts_implementation
     from transformers.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
     from transformers.models.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM
     from transformers.quantizers.quantizer_gguf import GGUFQuantizer
@@ -203,8 +210,98 @@ class GGUFOnDemandTests(unittest.TestCase):
         )
         experts = GGUFExperts(config)
         experts.config._experts_implementation_internal = "eager"
+        self.assertEqual(experts.weight_state, "placeholder")
         with self.assertRaisesRegex(RuntimeError, "GGUFExperts weights have not been loaded"):
             experts(torch.randn(2, 4), torch.tensor([[0], [1]]), torch.ones(2, 1))
+
+    def test_gguf_expert_weight_states_are_explicit(self):
+        config = Qwen3MoeConfig(
+            hidden_size=6,
+            moe_intermediate_size=4,
+            num_experts=3,
+            num_experts_per_tok=1,
+            hidden_act="silu",
+        )
+        experts = GGUFExperts(config, compute_dtype=torch.float32)
+        experts.config._experts_implementation_internal = "eager"
+        floating_weights = {
+            "gate_proj": torch.randn(3, 4, 6),
+            "up_proj": torch.randn(3, 4, 6),
+            "down_proj": torch.randn(3, 6, 4),
+        }
+        for name, weight in floating_weights.items():
+            setattr(experts, name, torch.nn.Parameter(weight.clone()))
+
+        self.assertEqual(experts.weight_state, "floating")
+        output = experts(torch.randn(2, 6), torch.tensor([[0], [2]]), torch.ones(2, 1))
+        self.assertTrue(torch.isfinite(output).all())
+
+        gate_weight = floating_weights["gate_proj"]
+        experts.gate_proj = GGUFQuantizedTensor(
+            torch.from_numpy(_float_bytes(gate_weight)),
+            quant_type=gguf.GGMLQuantizationType.F32,
+            logical_shape=gate_weight.shape,
+        )
+        self.assertEqual(experts.weight_state, "mixed")
+        with self.assertRaisesRegex(RuntimeError, "must be all packed or all floating-point"):
+            experts(torch.randn(2, 6), torch.tensor([[0], [2]]), torch.ones(2, 1))
+
+    def test_gguf_expert_factory_uses_generic_source_contract_and_dtype(self):
+        config = SimpleNamespace(_experts_implementation="eager")
+
+        @use_experts_implementation
+        class CompatibleExperts(torch.nn.Module):
+            def __init__(self, config):
+                super().__init__()
+                self.num_experts = 3
+                self.hidden_dim = 6
+                self.intermediate_dim = 4
+                self.gate_up_proj = torch.nn.Parameter(torch.empty(3, 8, 6, dtype=torch.float64, device="meta"))
+                self.down_proj = torch.nn.Parameter(torch.empty(3, 6, 4, dtype=torch.float64, device="meta"))
+                self.act_fn = F.silu
+
+            def forward(self, hidden_states, top_k_index, top_k_weights):
+                raise NotImplementedError
+
+        source = CompatibleExperts(config)
+        self.assertEqual(source.projection_layout, "concatenated_gate_up")
+        self.assertEqual(source.gate_implementation, "default")
+
+        container = torch.nn.Module()
+        container.experts = source
+        replace_with_gguf_modules(container)
+        replacement: Any = container.experts
+        self.assertIsInstance(replacement, GGUFExperts)
+        self.assertEqual(replacement.compute_dtype, torch.float64)
+        self.assertEqual((replacement.num_experts, replacement.hidden_dim, replacement.intermediate_dim), (3, 6, 4))
+        self.assertEqual(replacement.projection_layout, "split_gate_up")
+        self.assertIsNone(replacement.is_concatenated)
+        self.assertEqual(
+            replacement.supported_experts_implementations,
+            ("eager", "grouped_mm", "batched_mm"),
+        )
+        self.assertTrue(replacement.experts_implementation_switchable)
+
+        for attribute, value, error in (
+            ("has_bias", True, "projection bias"),
+            ("is_transposed", True, "transposed expert projections"),
+            ("projection_layout", "interleaved_gate_up", "source projection layout"),
+            ("gate_implementation", "custom", "custom gate behavior"),
+        ):
+            with self.subTest(attribute=attribute):
+                incompatible = CompatibleExperts(config)
+                setattr(incompatible, attribute, value)
+                with self.assertRaisesRegex(ValueError, error):
+                    GGUFExperts.from_module(incompatible)
+
+        incompatible_container = torch.nn.Module()
+        incompatible_container.linear = torch.nn.Linear(2, 2)
+        incompatible_experts: Any = CompatibleExperts(config)
+        incompatible_experts.has_bias = True
+        incompatible_container.experts = incompatible_experts
+        with self.assertRaisesRegex(ValueError, "projection bias"):
+            replace_with_gguf_modules(incompatible_container)
+        self.assertIs(type(incompatible_container.linear), torch.nn.Linear)
 
     def test_gguf_module_factories_preserve_structure_and_meta_device(self):
         source_linear = torch.nn.Linear(4, 3, bias=True, device="meta", dtype=torch.bfloat16)
@@ -670,24 +767,24 @@ class GGUFOnDemandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir, self.assertRaisesRegex(ValueError, "not serializable"):
             model.save_pretrained(tmpdir)
 
-    def test_qwen3_moe_expert_backends_match_dense_reference(self):
+    def test_qwen3_moe_expert_backends_match_non_square_reference_and_gradients(self):
         from unittest.mock import patch
 
         from transformers.integrations.gguf import _dequantize_experts
 
         config = Qwen3MoeConfig(
             hidden_size=8,
-            moe_intermediate_size=8,
+            moe_intermediate_size=12,
             num_experts=5,
             num_experts_per_tok=2,
             hidden_act="silu",
         )
-        module = GGUFExperts(config, compute_dtype=torch.bfloat16)
+        module = GGUFExperts(config, compute_dtype=torch.float32)
         torch.manual_seed(0)
         full_weights = {
-            "gate_proj": torch.randn(5, 8, 8),
-            "up_proj": torch.randn(5, 8, 8),
-            "down_proj": torch.randn(5, 8, 8),
+            "gate_proj": torch.randn(5, 12, 8),
+            "up_proj": torch.randn(5, 12, 8),
+            "down_proj": torch.randn(5, 8, 12),
         }
         for name, full_weight in full_weights.items():
             setattr(
@@ -703,25 +800,36 @@ class GGUFOnDemandTests(unittest.TestCase):
         hidden_states = torch.randn(4, 8)
         top_k_index = torch.tensor([[0, 1], [2, 1], [0, 2], [1, 1]])
         top_k_weights = torch.tensor([[0.7, 0.3], [0.4, 0.6], [0.2, 0.8], [0.55, 0.45]])
-        expected = torch.zeros_like(hidden_states, dtype=module.compute_dtype)
-        for token_idx in range(hidden_states.shape[0]):
-            for top_k_pos in range(top_k_index.shape[1]):
-                expert_idx = top_k_index[token_idx, top_k_pos]
-                current_state = hidden_states[token_idx].to(module.compute_dtype)
-                gate = F.linear(current_state, full_weights["gate_proj"][expert_idx].to(module.compute_dtype))
-                up = F.linear(current_state, full_weights["up_proj"][expert_idx].to(module.compute_dtype))
-                output = F.linear(F.silu(gate) * up, full_weights["down_proj"][expert_idx].to(module.compute_dtype))
-                expected[token_idx] += output * top_k_weights[token_idx, top_k_pos].to(module.compute_dtype)
-        expected = expected.to(hidden_states.dtype)
+        grad_output = torch.randn_like(hidden_states)
 
+        def reference_forward(inputs, routing_weights):
+            outputs = []
+            for token_idx in range(inputs.shape[0]):
+                token_output = torch.zeros(8, dtype=module.compute_dtype)
+                for top_k_pos in range(top_k_index.shape[1]):
+                    expert_idx = top_k_index[token_idx, top_k_pos]
+                    current_state = inputs[token_idx].to(module.compute_dtype)
+                    gate = F.linear(current_state, full_weights["gate_proj"][expert_idx])
+                    up = F.linear(current_state, full_weights["up_proj"][expert_idx])
+                    output = F.linear(F.silu(gate) * up, full_weights["down_proj"][expert_idx])
+                    token_output = token_output + output * routing_weights[token_idx, top_k_pos]
+                outputs.append(token_output)
+            return torch.stack(outputs).to(inputs.dtype)
+
+        self.assertEqual(module.weight_state, "packed")
         for implementation in ("eager", "grouped_mm", "batched_mm"):
             module.config._experts_implementation_internal = implementation
             inputs = hidden_states.detach().clone().requires_grad_(True)
+            routing_weights = top_k_weights.detach().clone().requires_grad_(True)
+            reference_inputs = hidden_states.detach().clone().requires_grad_(True)
+            reference_routing_weights = top_k_weights.detach().clone().requires_grad_(True)
+            expected = reference_forward(reference_inputs, reference_routing_weights)
             with patch(
                 "transformers.integrations.gguf._dequantize_experts", wraps=_dequantize_experts
             ) as dequantize_experts:
-                actual = module(inputs, top_k_index, top_k_weights)
-            torch.testing.assert_close(actual, expected, rtol=5e-3, atol=0.1)
+                actual = module(inputs, top_k_index, routing_weights)
+            self.assertEqual(actual.dtype, inputs.dtype)
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
             dequantized_expert_ids = {
                 int(expert_id)
                 for call in dequantize_experts.call_args_list
@@ -729,8 +837,18 @@ class GGUFOnDemandTests(unittest.TestCase):
             }
             self.assertEqual(dequantized_expert_ids, {0, 1, 2})
             self.assertTrue(all(call.args[2] == module.compute_dtype for call in dequantize_experts.call_args_list))
-            actual.sum().backward()
-            self.assertIsNotNone(inputs.grad)
+
+            actual.backward(grad_output)
+            expected.backward(grad_output)
+            assert inputs.grad is not None and reference_inputs.grad is not None
+            torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=1e-5, atol=1e-6)
+            assert routing_weights.grad is not None and reference_routing_weights.grad is not None
+            torch.testing.assert_close(
+                routing_weights.grad,
+                reference_routing_weights.grad,
+                rtol=1e-5,
+                atol=1e-6,
+            )
 
         self.assertEqual(dict(module.named_buffers()), {})
         self.assertEqual(set(dict(module.named_parameters())), {"gate_proj", "up_proj", "down_proj"})
