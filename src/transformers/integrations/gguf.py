@@ -129,6 +129,31 @@ class GGUFLinear(_GGUFComputeDtypeMixin, nn.Linear):
             compute_dtype=compute_dtype or module.weight.dtype,
         )
 
+    def materialize_logical_weight(
+        self,
+        *,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Materialize the floating matrix represented by this module's packed or floating weight.
+
+        Callers should keep the returned tensor scoped to one operation; packed weights remain
+        frozen and are dequantized again on the next call.
+        """
+
+        dtype = self.compute_dtype if dtype is None else dtype
+        if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
+            raise TypeError(f"GGUF logical weights require a floating-point dtype, got {dtype!r}")
+        device = self.weight.device if device is None else torch.device(device)
+
+        if isinstance(self.weight, GGUFQuantizedTensor):
+            weight = _dequantize_weight(self.weight, dtype, device)
+        else:
+            if not self.weight.is_floating_point():
+                raise RuntimeError("GGUFLinear weight has not been loaded with a packed or floating-point parameter")
+            weight = self.weight.to(device=device, dtype=dtype)
+        return weight.contiguous()
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if not isinstance(self.weight, GGUFQuantizedTensor):
             if not self.weight.is_floating_point():

@@ -117,6 +117,12 @@ class GGUFOnDemandTests(unittest.TestCase):
         module.weight = compressed
         inputs = torch.randn(2, 3, 4, requires_grad=True)
         torch.testing.assert_close(module(inputs), F.linear(inputs, full_weight))
+        torch.testing.assert_close(module.materialize_logical_weight(), full_weight)
+        logical_bf16 = module.materialize_logical_weight(dtype=torch.bfloat16, device="cpu")
+        self.assertEqual(logical_bf16.dtype, torch.bfloat16)
+        torch.testing.assert_close(logical_bf16, full_weight.to(torch.bfloat16))
+        with self.assertRaisesRegex(TypeError, "floating-point dtype"):
+            module.materialize_logical_weight(dtype=torch.int32)
         module(inputs).sum().backward()
         self.assertIsNotNone(inputs.grad)
         self.assertIn("weight", dict(module.named_parameters()))
@@ -175,6 +181,8 @@ class GGUFOnDemandTests(unittest.TestCase):
         linear = GGUFLinear(4, 3, bias=False)
         with self.assertRaisesRegex(RuntimeError, "GGUFLinear weight has not been loaded"):
             linear(torch.randn(2, 4))
+        with self.assertRaisesRegex(RuntimeError, "GGUFLinear weight has not been loaded"):
+            linear.materialize_logical_weight()
 
         embedding = GGUFEmbedding(3, 4)
         with self.assertRaisesRegex(RuntimeError, "GGUFEmbedding weight has not been loaded"):
@@ -356,6 +364,9 @@ class GGUFOnDemandTests(unittest.TestCase):
         actual = linear(inputs)
         self.assertEqual(actual.dtype, torch.float32)
         torch.testing.assert_close(actual, F.linear(inputs, full_weight, bias))
+        torch.testing.assert_close(
+            linear.materialize_logical_weight(dtype=torch.float64), full_weight.to(torch.float64)
+        )
 
         embedding = GGUFEmbedding(3, 4, compute_dtype=torch.float64)
         embedding.weight = torch.nn.Parameter(full_weight.clone())
