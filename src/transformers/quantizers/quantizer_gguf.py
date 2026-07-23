@@ -145,7 +145,7 @@ class GGUFQuantizer(HfQuantizer):
     def preserve_checkpoint_dtype(self, tensor, **kwargs):
         from ..integrations.gguf_dequant import GGUFQuantizedTensor
 
-        return isinstance(tensor, GGUFQuantizedTensor)
+        return isinstance(tensor, GGUFQuantizedTensor) or getattr(tensor, "is_gguf_quantized", False)
 
     def param_element_size(self, model, param_name, param):
         if self.persistent and param_name in self.param_storage_bytes and param.numel() > 0:

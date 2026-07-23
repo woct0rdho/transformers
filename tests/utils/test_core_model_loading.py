@@ -242,7 +242,101 @@ class DummyRoot(PreTrainedModel):
         self.post_init()
 
 
+class _ReleasableTensorSource:
+    def __init__(self, tensor, *, fail=False):
+        self.tensor = tensor
+        self.dtype = tensor.dtype
+        self.shape = tuple(tensor.shape)
+        self.fail = fail
+        self.prepared_count = None
+        self.remaining = None
+        self.release_count = 0
+
+    def __getitem__(self, key):
+        if self.fail:
+            raise RuntimeError("materialization failed")
+        return self.tensor[key]
+
+    def is_floating_point(self):
+        return self.tensor.is_floating_point()
+
+    def prepare_materializations(self, count):
+        self.prepared_count = count
+        self.remaining = count
+
+    @property
+    def release_after_materialization(self):
+        return self._release
+
+    def is_materialized_view(self, tensor):
+        return tensor.device.type == "cpu" and tensor.data_ptr() == self.tensor.data_ptr()
+
+    def _release(self):
+        self.remaining = 1 if self.remaining is None else self.remaining
+        self.remaining -= 1
+        if self.remaining == 0:
+            self.release_count += 1
+
+
 class TestConvertAndLoadStateDict(unittest.TestCase):
+    def test_releasable_source_is_copied_before_success_callback(self):
+        backing = torch.arange(6, dtype=torch.float32)
+        source = _ReleasableTensorSource(backing)
+
+        loaded = spawn_materialize(None, source, device="cpu", dtype=torch.float32)()
+
+        self.assertEqual(source.release_count, 1)
+        self.assertNotEqual(loaded.data_ptr(), backing.data_ptr())
+        backing.zero_()
+        torch.testing.assert_close(loaded, torch.arange(6, dtype=torch.float32))
+
+    def test_releasable_source_is_not_released_after_failed_materialization(self):
+        source = _ReleasableTensorSource(torch.arange(4), fail=True)
+
+        with self.assertRaisesRegex(RuntimeError, "materialization failed"):
+            spawn_materialize(None, source)()
+
+        self.assertEqual(source.release_count, 0)
+
+    def test_releasable_sharded_source_is_copied_before_callback(self):
+        class IdentityShard:
+            @staticmethod
+            def shard_tensor(source, **kwargs):
+                return source[...]
+
+        backing = torch.arange(4, dtype=torch.float32)
+        source = _ReleasableTensorSource(backing)
+        loaded = spawn_materialize(None, source, sharding_op=IdentityShard())()
+
+        self.assertEqual(source.release_count, 1)
+        self.assertNotEqual(loaded.data_ptr(), backing.data_ptr())
+
+    def test_shared_releasable_source_waits_for_all_state_dict_consumers(self):
+        class SharedSourceModel(PreTrainedModel):
+            base_model_prefix = ""
+
+            def __init__(self):
+                super().__init__(PreTrainedConfig())
+                self.first = nn.Parameter(torch.zeros(4))
+                self.second = nn.Parameter(torch.zeros(4))
+                self.post_init()
+
+        backing = torch.arange(4, dtype=torch.float32)
+        source = _ReleasableTensorSource(backing)
+        model = SharedSourceModel()
+        loading_info, _ = convert_and_load_state_dict_in_model(
+            model,
+            {"first": source, "second": source},
+            LoadStateDictConfig(device_map={"": "cpu"}, dtype=torch.float32),
+        )
+
+        self.assertEqual(loading_info.missing_keys, set())
+        self.assertEqual(source.prepared_count, 2)
+        self.assertEqual(source.remaining, 0)
+        self.assertEqual(source.release_count, 1)
+        self.assertNotEqual(model.first.data_ptr(), backing.data_ptr())
+        self.assertNotEqual(model.second.data_ptr(), backing.data_ptr())
+
     def test_dtensor_shard_aware_mixtral_conversion_uses_only_local_experts(self):
         """Integration test: FSDP-sharded expert loading + WeightConverter.
 

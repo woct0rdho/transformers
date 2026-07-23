@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import mmap
+import os
+import threading
+import warnings
+
 from .integrations import (
     GGUF_CONFIG_DEFAULTS_MAPPING,
     GGUF_CONFIG_MAPPING,
@@ -557,6 +562,144 @@ def _is_gguf_ordinary_tensor_type(tensor_type, ggml_quantization_type):
     }
 
 
+def _page_aligned_interior(offset: int, length: int, page_size: int) -> tuple[int, int] | None:
+    """Return complete pages contained in a byte range, excluding shared boundary pages."""
+    start = ((offset + page_size - 1) // page_size) * page_size
+    end = ((offset + length) // page_size) * page_size
+    return (start, end - start) if end > start else None
+
+
+class _GGUFFileRangeReleaser:
+    """Release completed tensor pages from a GGUF file mapping and the page cache."""
+
+    def __init__(self, path, mapped_array):
+        self._fd = None
+        mapped_file = getattr(mapped_array, "_mmap", None)
+        if mapped_file is None or not hasattr(mapped_file, "madvise") or not hasattr(mmap, "MADV_DONTNEED"):
+            raise RuntimeError("GGUF mmap page release requires mmap.madvise(MADV_DONTNEED) support")
+
+        self._mapped_file = mapped_file
+        self._page_size = mmap.PAGESIZE
+        self._lock = threading.Lock()
+        if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+            self._fd = os.open(os.fspath(path), os.O_RDONLY)
+
+    def release(self, offset: int, length: int) -> None:
+        aligned_range = _page_aligned_interior(offset, length, self._page_size)
+        if aligned_range is None:
+            return
+        aligned_offset, aligned_length = aligned_range
+        with self._lock:
+            self._mapped_file.madvise(mmap.MADV_DONTNEED, aligned_offset, aligned_length)
+            if self._fd is not None:
+                os.posix_fadvise(self._fd, aligned_offset, aligned_length, os.POSIX_FADV_DONTNEED)
+
+    def close(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except (AttributeError, OSError):
+            return
+
+
+class _GGUFTensorSource:
+    """Lazy tensor-like view over one GGUF reader tensor."""
+
+    def __init__(
+        self,
+        reader_tensor,
+        *,
+        is_quantized: bool,
+        releaser: _GGUFFileRangeReleaser | None = None,
+    ):
+        import numpy as np
+        import torch
+
+        self.name = reader_tensor.name
+        self.quant_type = reader_tensor.tensor_type
+        self.logical_shape = tuple(int(dim) for dim in reversed(reader_tensor.shape))
+        self.shape = tuple(reader_tensor.data.shape)
+        self.dtype = torch.from_numpy(np.empty(0, dtype=reader_tensor.data.dtype)).dtype
+        self.is_gguf_quantized = is_quantized
+        self._array = reader_tensor.data
+        self._offset = int(reader_tensor.data_offset)
+        self._n_bytes = int(reader_tensor.n_bytes)
+        self._releaser = releaser
+        self._remaining_materializations = None
+        self._release_lock = threading.Lock()
+
+    def get_shape(self) -> list[int]:
+        return list(self.shape)
+
+    def get_dtype(self) -> str:
+        return str(self.dtype).removeprefix("torch.").upper()
+
+    def numel(self) -> int:
+        return int(self._array.size)
+
+    def element_size(self) -> int:
+        return int(self._array.dtype.itemsize)
+
+    def is_floating_point(self) -> bool:
+        return self.dtype.is_floating_point
+
+    def __getitem__(self, key):
+        import torch
+
+        from .integrations.gguf_dequant import GGUFQuantizedTensor
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
+            tensor = torch.from_numpy(self._array[key])
+        if self.is_gguf_quantized and key is Ellipsis:
+            return GGUFQuantizedTensor(
+                tensor,
+                quant_type=self.quant_type,
+                logical_shape=self.logical_shape,
+            )
+        return tensor
+
+    @property
+    def release_after_materialization(self):
+        return self._release_after_materialization if self._releaser is not None else None
+
+    def prepare_materializations(self, count: int) -> None:
+        if count <= 0:
+            raise ValueError(f"GGUF tensor materialization count must be positive, got {count}")
+        with self._release_lock:
+            if self._remaining_materializations is not None:
+                raise RuntimeError(f"GGUF tensor source {self.name!r} was prepared more than once")
+            self._remaining_materializations = count
+
+    def is_materialized_view(self, tensor) -> bool:
+        if tensor.device.type != "cpu" or tensor.numel() == 0:
+            return False
+        try:
+            tensor_pointer = tensor.data_ptr()
+        except RuntimeError:
+            return False
+        source_pointer = int(self._array.__array_interface__["data"][0])
+        return source_pointer <= tensor_pointer < source_pointer + self._n_bytes
+
+    def _release_after_materialization(self) -> None:
+        should_release = False
+        with self._release_lock:
+            remaining = self._remaining_materializations
+            if remaining is None:
+                remaining = 1
+            if remaining <= 0:
+                raise RuntimeError(f"GGUF tensor source {self.name!r} was released more than expected")
+            remaining -= 1
+            self._remaining_materializations = remaining
+            should_release = remaining == 0
+        if should_release:
+            self._releaser.release(self._offset, self._n_bytes)
+
+
 def _postprocess_qwen35_config(config):
     """Build the strict Qwen3.5 text configuration derived from GGUF metadata."""
 
@@ -795,7 +938,7 @@ def _postprocess_deepseek_v4_config(config):
         raise ValueError(f"DeepSeek V4 GGUF has unsupported RoPE scaling type {rope_scaling_type!r}")
 
 
-def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
+def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, mmap_policy="keep"):
     """
     Load a GGUF file and return a dictionary of parsed parameters containing tensors, the parsed
     tokenizer and config attributes.
@@ -806,7 +949,12 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
         return_tensors (`bool`, defaults to `False`):
             Whether to read the tensors from the file and return them. Not doing so is faster
             and only loads the metadata in memory.
+        mmap_policy (`str`, defaults to `"keep"`):
+            Whether to keep materialized GGUF mmap pages resident or release each tensor's complete
+            pages after the checkpoint loader has copied it to independent storage.
     """
+    if mmap_policy not in {"keep", "release"}:
+        raise ValueError(f"GGUF mmap policy must be 'keep' or 'release', got {mmap_policy!r}")
     if is_gguf_available() and is_torch_available():
         from gguf import GGMLQuantizationType, GGUFReader
     else:
@@ -991,29 +1139,18 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
         config = parsed_parameters.get("config", {})
         model_type = config.get("model_type", architecture)
 
-        # Keep compressed payloads in a metadata-carrying tensor subclass; floating and integer values load normally.
-        import warnings
-
-        import torch  # local: keep top-of-file import-light when torch isn't required
-
-        def as_torch_tensor(array):
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
-                return torch.from_numpy(array)
-
         # Tensors GGUF ships as metadata for its own runtime but HF models compute on the
         # fly (or don't store as a parameter). Skip so they don't show up as "unexpected".
         _GGUF_RUNTIME_AUX_TENSORS = frozenset({"rope_freqs.weight"})
-
+        releaser = _GGUFFileRangeReleaser(gguf_checkpoint_path, reader.data) if mmap_policy == "release" else None
         parsed_parameters["tensors"] = {
-            tensor.name: (
-                as_torch_tensor(tensor.data)
-                if _is_gguf_ordinary_tensor_type(tensor.tensor_type, GGMLQuantizationType)
-                else GGUFQuantizedTensor(
-                    as_torch_tensor(tensor.data),
-                    quant_type=tensor.tensor_type,
-                    logical_shape=tuple(int(dim) for dim in reversed(tensor.shape)),
-                )
+            tensor.name: _GGUFTensorSource(
+                tensor,
+                is_quantized=not _is_gguf_ordinary_tensor_type(
+                    tensor.tensor_type,
+                    GGMLQuantizationType,
+                ),
+                releaser=releaser,
             )
             for tensor in reader.tensors
             if tensor.name not in _GGUF_RUNTIME_AUX_TENSORS

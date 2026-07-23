@@ -1243,12 +1243,27 @@ class WeightConverter(WeightTransform):
 GLOBAL_WORKERS = min(4, os.cpu_count() or 4)
 
 
-def _materialize_copy(tensor: torch.Tensor, device=None, dtype=None) -> torch.Tensor:
-    # This slicing is what actually loads the tensor from the safetensors slice object
+def _finish_materialization(source: Any, tensor: torch.Tensor | None) -> torch.Tensor | None:
+    """Detach a materialized value from a releasable source, then notify the source."""
+    release = getattr(source, "release_after_materialization", None)
+    if not callable(release):
+        return tensor
+
+    if tensor is not None:
+        shares_storage = getattr(source, "is_materialized_view", None)
+        if not callable(shares_storage) or shares_storage(tensor):
+            tensor = tensor.to(copy=True)
+    release()
+    return tensor
+
+
+def _materialize_copy(tensor: Any, device=None, dtype=None) -> torch.Tensor:
+    source = tensor
+    # This slicing is what actually loads the tensor from a lazy checkpoint source.
     tensor = tensor[...]
     if dtype is not None or device is not None:
         tensor = tensor.to(device=device, dtype=dtype)
-    return tensor
+    return _finish_materialization(source, tensor)
 
 
 def spawn_materialize(
@@ -1268,7 +1283,8 @@ def spawn_materialize(
 
     def _job():
         if sharding_op is not None:
-            return sharding_op.shard_tensor(tensor, tensor_idx=tensor_idx, device=device, dtype=dtype)
+            materialized = sharding_op.shard_tensor(tensor, tensor_idx=tensor_idx, device=device, dtype=dtype)
+            return _finish_materialization(tensor, materialized)
         return _materialize_copy(tensor, device, dtype)
 
     if thread_pool is not None:
@@ -1656,6 +1672,20 @@ def convert_and_load_state_dict_in_model(
         dtype_policy_alt, dtype_policy_by_group_name, _ = build_glob_alternation(list(dtype_plan.keys()))
 
     pattern_to_converter = {k: converter for converter in converters for k in converter.source_patterns}
+
+    # A checkpoint source can be aliased by multiple keys. Register all consumers before workers start so a source
+    # does not release backing storage while another materialization still needs it.
+    materialization_sources = {}
+    materialization_counts = defaultdict(int)
+    for tensor in state_dict.values():
+        if callable(getattr(tensor, "release_after_materialization", None)):
+            source_id = id(tensor)
+            materialization_sources[source_id] = tensor
+            materialization_counts[source_id] += 1
+    for source_id, count in materialization_counts.items():
+        prepare = getattr(materialization_sources[source_id], "prepare_materializations", None)
+        if callable(prepare):
+            prepare(count)
 
     state_dict = sorted(state_dict.items(), key=lambda kv: dot_natural_key(kv[0]))
     for original_key, tensor in state_dict:

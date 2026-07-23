@@ -118,6 +118,84 @@ class GGUFOnDemandTests(unittest.TestCase):
         self.assertTrue(_is_gguf_ordinary_tensor_type(gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType))
         self.assertFalse(_is_gguf_ordinary_tensor_type(gguf.GGMLQuantizationType.Q8_0, gguf.GGMLQuantizationType))
 
+    def test_invalid_gguf_mmap_policy_is_rejected(self):
+        from transformers.modeling_gguf_pytorch_utils import load_gguf_checkpoint
+
+        with self.assertRaisesRegex(ValueError, "mmap policy must be 'keep' or 'release'"):
+            load_gguf_checkpoint("unused.gguf", mmap_policy="invalid")
+
+    def test_gguf_tensor_source_materializes_ordinary_and_packed_tensors_lazily(self):
+        from transformers.modeling_gguf_pytorch_utils import _GGUFTensorSource
+
+        ordinary_array = np.arange(6, dtype=np.int32).reshape(2, 3)
+        ordinary_reader_tensor = SimpleNamespace(
+            name="routing",
+            tensor_type=gguf.GGMLQuantizationType.I32,
+            shape=np.array([3, 2], dtype=np.uint64),
+            data=ordinary_array,
+            data_offset=128,
+            n_bytes=ordinary_array.nbytes,
+        )
+        ordinary = _GGUFTensorSource(ordinary_reader_tensor, is_quantized=False)
+        self.assertEqual(ordinary.get_shape(), [2, 3])
+        self.assertEqual(ordinary.get_dtype(), "INT32")
+        self.assertEqual(ordinary.logical_shape, (2, 3))
+        self.assertIsNone(ordinary.release_after_materialization)
+        torch.testing.assert_close(ordinary[...], torch.from_numpy(ordinary_array))
+
+        packed_array = np.arange(72, dtype=np.uint8).reshape(4, 18)
+        packed_reader_tensor = SimpleNamespace(
+            name="weight",
+            tensor_type=gguf.GGMLQuantizationType.Q4_0,
+            shape=np.array([32, 4], dtype=np.uint64),
+            data=packed_array,
+            data_offset=4096,
+            n_bytes=packed_array.nbytes,
+        )
+        packed = _GGUFTensorSource(packed_reader_tensor, is_quantized=True)
+        materialized = packed[...]
+        self.assertIsInstance(materialized, GGUFQuantizedTensor)
+        self.assertEqual(materialized.quant_type, gguf.GGMLQuantizationType.Q4_0)
+        self.assertEqual(materialized.logical_shape, (4, 32))
+        self.assertEqual(materialized.shape, (4, 18))
+
+    def test_gguf_tensor_source_releases_range_after_independent_copy(self):
+        from transformers.core_model_loading import spawn_materialize
+        from transformers.modeling_gguf_pytorch_utils import _GGUFTensorSource
+
+        class RangeRecorder:
+            def __init__(self):
+                self.calls = []
+
+            def release(self, offset, length):
+                self.calls.append((offset, length))
+
+        packed_array = np.arange(72, dtype=np.uint8).reshape(4, 18)
+        reader_tensor = SimpleNamespace(
+            name="weight",
+            tensor_type=gguf.GGMLQuantizationType.Q4_0,
+            shape=np.array([32, 4], dtype=np.uint64),
+            data=packed_array,
+            data_offset=8192,
+            n_bytes=packed_array.nbytes,
+        )
+        recorder = RangeRecorder()
+        source = _GGUFTensorSource(reader_tensor, is_quantized=True, releaser=recorder)
+        materialized = spawn_materialize(None, source, device="cpu")()
+
+        self.assertIsInstance(materialized, GGUFQuantizedTensor)
+        self.assertEqual(recorder.calls, [(8192, packed_array.nbytes)])
+        self.assertNotEqual(materialized.data_ptr(), torch.from_numpy(packed_array).data_ptr())
+        packed_array.fill(0)
+        self.assertFalse(torch.all(materialized.as_subclass(torch.Tensor) == 0))
+
+    def test_gguf_page_release_excludes_unaligned_shared_boundaries(self):
+        from transformers.modeling_gguf_pytorch_utils import _page_aligned_interior
+
+        self.assertEqual(_page_aligned_interior(123, 9000, 4096), (4096, 4096))
+        self.assertEqual(_page_aligned_interior(4096, 8192, 4096), (4096, 8192))
+        self.assertIsNone(_page_aligned_interior(123, 3000, 4096))
+
     def test_quantized_tensor_movement_preserves_storage_and_metadata(self):
         tensor = GGUFQuantizedTensor(
             torch.arange(16, dtype=torch.uint8).reshape(2, 8),

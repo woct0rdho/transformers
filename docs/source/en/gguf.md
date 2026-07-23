@@ -24,10 +24,10 @@ rendered properly in your Markdown viewer.
 
 The GGUF format also supports many quantized data types (refer to [quantization type table](https://hf.co/docs/hub/en/gguf#quantization-types) for a complete list of supported quantization types) which saves a significant amount of memory, making inference with large models like Whisper and Llama feasible on local and edge devices.
 
-Transformers supports two GGUF loading modes. Qwen3, Qwen3-MoE, and text-only Qwen3.5 checkpoints keep quantized payloads as frozen model parameters and dequantize weights during `forward`. Other registered architectures use the compatibility path, which dequantizes weights while loading. Both modes use the normal Transformers quantizer lifecycle and weight-conversion pipeline.
+Transformers supports two GGUF loading modes. Qwen3, Qwen3-MoE, text-only Qwen3.5, and DeepSeek V4 checkpoints keep quantized payloads as frozen model parameters and dequantize weights during `forward`. Other registered architectures use the compatibility path, which dequantizes weights while loading. Both modes use the normal Transformers quantizer lifecycle and weight-conversion pipeline.
 
 > [!TIP]
-> Architectures wired up for GGUF loading include Llama, Mistral, Phi3, Cohere, Qwen2, Qwen3, Deci, StableLM, Starcoder2, Nemotron, Gemma2, Gemma3 (text + multimodal), Gemma4, Bloom, GPT2, Mamba, LFM2, Falcon, Qwen2-MoE, Qwen3-MoE, Qwen3.5 text, Qwen3.5-MoE text, MiniMax-M2, GPT-OSS, T5, UMT5. Qwen3, Qwen3-MoE, and the Qwen3.5 text architectures currently have persistent quantized weights. The authoritative registry is `_GGUF_ARCH_CONVERTERS` in [`modeling_gguf_pytorch_utils.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_gguf_pytorch_utils.py).
+> Architectures wired up for GGUF loading include Llama, Mistral, Phi3, Cohere, Qwen2, Qwen3, Deci, StableLM, Starcoder2, Nemotron, Gemma2, Gemma3 (text + multimodal), Gemma4, Bloom, GPT2, Mamba, LFM2, Falcon, Qwen2-MoE, Qwen3-MoE, Qwen3.5 text, Qwen3.5-MoE text, DeepSeek V4, MiniMax-M2, GPT-OSS, T5, UMT5. Qwen3, Qwen3-MoE, the Qwen3.5 text architectures, and DeepSeek V4 currently have persistent quantized weights. The authoritative registry is `_GGUF_ARCH_CONVERTERS` in [`modeling_gguf_pytorch_utils.py`](https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_gguf_pytorch_utils.py).
 
 Add the `gguf_file` parameter to [`~PreTrainedModel.from_pretrained`] to specify the GGUF file to load.
 
@@ -49,6 +49,8 @@ model = AutoModelForCausalLM.from_pretrained(
 # a reliable fallback when a particular GGUF tokenizer cannot be converted.
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 ```
+
+For large checkpoints on systems where file-backed pages and accelerator allocations compete for the same physical memory, set `gguf_mmap_policy="release"`. GGUF tensors remain lazy, and each tensor's complete mmap pages are released with operating-system advice after the loader has copied its final consumer to independent storage. Unaligned boundary pages are retained because adjacent tensors can share them. The default policy is `"keep"`, which preserves normal mmap caching. Release mode requires `mmap.madvise(MADV_DONTNEED)` support and can reread evicted pages if another process or a later load needs them.
 
 Persistent Qwen models dequantize linear weights only for the active operation. Embeddings dequantize only requested token rows. A tied language-model head shares the compressed embedding payload rather than duplicating it, and dequantizes its complete logical weight for projection like other GGUF linear modules. When autograd needs a packed linear's input gradient, backward re-dequantizes that weight instead of retaining the forward's dense weight. Qwen3.5 hybrid models preserve their physical GGUF value-head layout inside packed GatedDeltaNet projections while exposing the canonical Transformers layout at projection and cache boundaries.
 

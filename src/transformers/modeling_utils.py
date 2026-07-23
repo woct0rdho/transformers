@@ -3967,6 +3967,7 @@ class PreTrainedModel(
         weights_only: bool = True,
         fusion_config: dict[str, bool | dict[str, Any]] | None = None,
         disable_mmap: bool | None = None,
+        gguf_mmap_policy: str = "keep",
         **kwargs,
     ) -> SpecificPreTrainedModelType:
         r"""
@@ -4150,6 +4151,10 @@ class PreTrainedModel(
                 (used by HF Spaces/Endpoints), where mmap + parallel page-faults can deadlock. When `True`,
                 files are read fully into memory and parsed with `safetensors.torch.load`. When `False`, the
                 default memory-mapped loader is always used.
+            gguf_mmap_policy (`str`, *optional*, defaults to `"keep"`):
+                Controls GGUF source-page residency during model loading. `"keep"` retains the operating system's
+                normal mmap behavior. `"release"` copies each materialized tensor to independent storage, then
+                advises the operating system to evict complete source pages that no remaining tensor alias needs.
             fusion_config (`dict[str, bool | dict[str, Any]]`, *optional*):
                 Optional fusion configuration applied before model instantiation. Each key enables a fusion family and
                 its value can either be `True` to enable that fusion with default options or a dictionary of
@@ -4288,6 +4293,8 @@ class PreTrainedModel(
 
         if gguf_file is not None and not is_accelerate_available():
             raise ValueError("accelerate is required when loading a GGUF file `pip install accelerate`.")
+        if gguf_file is None and gguf_mmap_policy != "keep":
+            raise ValueError("`gguf_mmap_policy` can only be used when loading a `gguf_file`.")
 
         if adapter_kwargs is None:
             adapter_kwargs = {}
@@ -4387,7 +4394,11 @@ class PreTrainedModel(
         if gguf_file:
             from .modeling_gguf_pytorch_utils import load_gguf_checkpoint
 
-            gguf_parsed = load_gguf_checkpoint(checkpoint_files[0], return_tensors=True)
+            gguf_parsed = load_gguf_checkpoint(
+                checkpoint_files[0],
+                return_tensors=True,
+                mmap_policy=gguf_mmap_policy,
+            )
             state_dict = gguf_parsed["tensors"]
             set_weight_mapping = getattr(hf_quantizer, "set_weight_mapping", None)
             if set_weight_mapping is None:
