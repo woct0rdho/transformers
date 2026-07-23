@@ -298,6 +298,43 @@ class TestConvertAndLoadStateDict(unittest.TestCase):
 
         self.assertEqual(source.release_count, 0)
 
+    def test_releasable_source_stages_before_accelerator_transfer(self):
+        class RecordingTensor:
+            def __init__(self, calls, device="cpu"):
+                self.calls = calls
+                self.device = torch.device(device)
+
+            def to(self, device=None, dtype=None, copy=False):
+                target_device = torch.device(device) if device is not None else self.device
+                self.calls.append((target_device.type, copy, dtype))
+                return RecordingTensor(self.calls, target_device)
+
+        class RecordingSource:
+            def __init__(self):
+                self.calls = []
+                self.release_count = 0
+
+            def __getitem__(self, key):
+                return RecordingTensor(self.calls)
+
+            @property
+            def release_after_materialization(self):
+                return self._release
+
+            @staticmethod
+            def is_materialized_view(tensor):
+                return False
+
+            def _release(self):
+                self.release_count += 1
+
+        source = RecordingSource()
+        loaded = spawn_materialize(None, source, device="cuda:0", dtype=torch.float16)()
+
+        self.assertEqual(source.calls, [("cpu", True, None), ("cuda", False, torch.float16)])
+        self.assertEqual(loaded.device.type, "cuda")
+        self.assertEqual(source.release_count, 1)
+
     def test_releasable_sharded_source_is_copied_before_callback(self):
         class IdentityShard:
             @staticmethod
