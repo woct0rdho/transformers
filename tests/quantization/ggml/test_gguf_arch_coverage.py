@@ -22,13 +22,16 @@ from types import SimpleNamespace
 from parameterized import parameterized
 
 from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
+from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.gguf_conversion_ops import Qwen3_5ReorderValueHeads
 from transformers.modeling_gguf_pytorch_utils import (
     _GGUF_ARCH_CONVERTERS,
+    _postprocess_deepseek_v4_config,
     _postprocess_qwen35_config,
     get_gguf_converters,
 )
 from transformers.quantizers.quantizer_gguf import GGUFQuantizer
+from transformers.utils.quantization_config import GGUFConfig
 
 
 # Every HF model_type the public GGUF integration tests exercise. Keep this
@@ -44,6 +47,7 @@ EXPECTED_MODEL_TYPES = sorted(
         "qwen3",
         "qwen3_5_text",
         "qwen3_5_moe_text",
+        "deepseek_v4",
         "deci",
         "stablelm",
         "starcoder2",
@@ -228,6 +232,145 @@ class GgufArchCoverageTests(unittest.TestCase):
             config["layer_types"],
             ["linear_attention", "full_attention", "linear_attention", "full_attention"],
         )
+
+    def test_deepseek_v4_config_reconstruction(self):
+        config = {
+            "model_type": "deepseek_v4",
+            "max_position_embeddings": 1024,
+            "num_hidden_layers": 4,
+            "hidden_size": 32,
+            "head_dim": 16,
+            "_gguf_attention_value_length": 16,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "q_lora_rank": 8,
+            "o_lora_rank": 8,
+            "o_groups": 2,
+            "n_routed_experts": 8,
+            "num_experts_per_tok": 2,
+            "n_shared_experts": 1,
+            "moe_intermediate_size": 12,
+            "sliding_window": 8,
+            "index_n_heads": 4,
+            "index_head_dim": 8,
+            "index_topk": 4,
+            "hc_mult": 2,
+            "hc_sinkhorn_iters": 3,
+            "rope_theta": 10000.0,
+            "compress_rope_theta": 160000.0,
+            "_gguf_rope_dimension_count": 4,
+            "_gguf_rope_scaling_type": "yarn",
+            "_gguf_rope_scaling_factor": 16.0,
+            "_gguf_rope_scaling_original_context_length": 64,
+            "_gguf_rope_scaling_beta_fast": 32.0,
+            "_gguf_rope_scaling_beta_slow": 1.0,
+            "_gguf_attention_compress_ratios": [0, 4, 128, 0],
+            "_gguf_hash_layer_count": 1,
+            "_gguf_swiglu_clamp_exp": [10.0] * 4,
+            "_gguf_swiglu_clamp_shexp": [10.0] * 4,
+            "_gguf_expert_gating_func": 4,
+        }
+        _postprocess_deepseek_v4_config(config)
+        self.assertEqual(
+            config["layer_types"],
+            [
+                "sliding_attention",
+                "compressed_sparse_attention",
+                "heavily_compressed_attention",
+                "sliding_attention",
+            ],
+        )
+        self.assertEqual(config["mlp_layer_types"], ["hash_moe", "moe", "moe", "moe"])
+        self.assertEqual(
+            config["compress_rates"],
+            {"compressed_sparse_attention": 4, "heavily_compressed_attention": 128},
+        )
+        self.assertEqual(config["partial_rotary_factor"], 0.25)
+        self.assertEqual(config["swiglu_limit"], 10.0)
+        self.assertEqual(config["scoring_func"], "sqrtsoftplus")
+        self.assertEqual(
+            config["rope_parameters"]["compress"],
+            {
+                "rope_type": "yarn",
+                "rope_theta": 160000.0,
+                "partial_rotary_factor": 0.25,
+                "factor": 16.0,
+                "original_max_position_embeddings": 64,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "attention_factor": 1.0,
+            },
+        )
+        self.assertFalse(any(key.startswith("_gguf_") for key in config))
+
+        invalid = dict(config)
+        invalid["num_hidden_layers"] = 2
+        invalid["head_dim"] = 16
+        invalid["_gguf_attention_value_length"] = 8
+        with self.assertRaisesRegex(ValueError, "key and value dimensions must match"):
+            _postprocess_deepseek_v4_config(invalid)
+
+    def test_deepseek_v4_converter_names(self):
+        rules = get_gguf_converters("deepseek_v4")
+        renamings = [rule for rule in rules if isinstance(rule, WeightRenaming)]
+        converters = [rule for rule in rules if isinstance(rule, WeightConverter)]
+        expected_names = {
+            "token_embd.weight": "model.embed_tokens.weight",
+            "output_norm.weight": "model.norm.weight",
+            "output.weight": "lm_head.weight",
+            "output_hc_fn.weight": "model.hc_head.hc_fn",
+            "output_hc_base.weight": "model.hc_head.hc_base",
+            "output_hc_scale.weight": "model.hc_head.hc_scale",
+            "blk.0.attn_norm.weight": "model.layers.0.input_layernorm.weight",
+            "blk.0.ffn_norm.weight": "model.layers.0.post_attention_layernorm.weight",
+            "blk.0.hc_attn_fn.weight": "model.layers.0.attn_hc.fn",
+            "blk.0.hc_ffn_scale.weight": "model.layers.0.ffn_hc.scale",
+            "blk.0.attn_sinks.weight": "model.layers.0.self_attn.sinks",
+            "blk.0.attn_q_a.weight": "model.layers.0.self_attn.q_a_proj.weight",
+            "blk.0.attn_q_a_norm.weight": "model.layers.0.self_attn.q_a_norm.weight",
+            "blk.0.attn_q_b.weight": "model.layers.0.self_attn.q_b_proj.weight",
+            "blk.0.attn_kv.weight": "model.layers.0.self_attn.kv_proj.weight",
+            "blk.0.attn_kv_a_norm.weight": "model.layers.0.self_attn.kv_norm.weight",
+            "blk.0.attn_output_a.weight": "model.layers.0.self_attn.o_a_proj.weight",
+            "blk.0.attn_output_b.weight": "model.layers.0.self_attn.o_b_proj.weight",
+            "blk.0.attn_compressor_ape.weight": "model.layers.0.self_attn.compressor.position_bias",
+            "blk.0.attn_compressor_kv.weight": "model.layers.0.self_attn.compressor.kv_proj.weight",
+            "blk.0.attn_compressor_gate.weight": "model.layers.0.self_attn.compressor.gate_proj.weight",
+            "blk.0.attn_compressor_norm.weight": "model.layers.0.self_attn.compressor.kv_norm.weight",
+            "blk.0.indexer.attn_q_b.weight": "model.layers.0.self_attn.compressor.indexer.q_b_proj.weight",
+            "blk.0.indexer.proj.weight": "model.layers.0.self_attn.compressor.indexer.scorer.weights_proj.weight",
+            "blk.0.indexer_compressor_ape.weight": "model.layers.0.self_attn.compressor.indexer.position_bias",
+            "blk.0.indexer_compressor_kv.weight": "model.layers.0.self_attn.compressor.indexer.kv_proj.weight",
+            "blk.0.indexer_compressor_gate.weight": "model.layers.0.self_attn.compressor.indexer.gate_proj.weight",
+            "blk.0.indexer_compressor_norm.weight": "model.layers.0.self_attn.compressor.indexer.kv_norm.weight",
+            "blk.0.ffn_gate_inp.weight": "model.layers.0.mlp.gate.weight",
+            "blk.0.ffn_gate_tid2eid.weight": "model.layers.0.mlp.gate.tid2eid",
+            "blk.0.exp_probs_b.bias": "model.layers.0.mlp.gate.e_score_correction_bias",
+            "blk.0.ffn_gate_shexp.weight": "model.layers.0.mlp.shared_experts.gate_proj.weight",
+            "blk.0.ffn_up_shexp.weight": "model.layers.0.mlp.shared_experts.up_proj.weight",
+            "blk.0.ffn_down_shexp.weight": "model.layers.0.mlp.shared_experts.down_proj.weight",
+            "blk.0.ffn_gate_exps.weight": "model.layers.0.mlp.experts.gate_up_proj",
+            "blk.0.ffn_up_exps.weight": "model.layers.0.mlp.experts.gate_up_proj",
+            "blk.0.ffn_down_exps.weight": "model.layers.0.mlp.experts.down_proj",
+        }
+        for source, expected in expected_names.items():
+            actual, _ = rename_source_key(source, renamings, converters)
+            self.assertEqual(actual, expected)
+
+    def test_deepseek_v4_gguf_pipeline_keeps_root_norm(self):
+        gguf_rules = get_gguf_converters("deepseek_v4")
+        quantizer = GGUFQuantizer(
+            GGUFConfig(architecture="deepseek_v4"),
+            weight_mapping=gguf_rules,
+        )
+        rules = quantizer.update_weight_conversions(get_checkpoint_conversion_mapping("deepseek_v4"))
+        renamings = [rule for rule in rules if isinstance(rule, WeightRenaming)]
+        converters = [rule for rule in rules if isinstance(rule, WeightConverter)]
+
+        actual, _ = rename_source_key("output_norm.weight", renamings, converters)
+        self.assertEqual(actual, "model.norm.weight")
+        actual, _ = rename_source_key("model.layers.0.self_attn.norm.weight", renamings, converters)
+        self.assertEqual(actual, "model.layers.0.self_attn.kv_norm.weight")
 
     def test_qwen35_converter_names_and_value_head_reorder(self):
         import torch

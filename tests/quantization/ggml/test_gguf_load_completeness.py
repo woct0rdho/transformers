@@ -119,7 +119,9 @@ class GgufLoadCompletenessTests(unittest.TestCase):
         """
         covered = {row[0] for row in GGUF_LOAD_CELLS}
         registered = set(_GGUF_ARCH_CONVERTERS)
-        known_skip = {"t5", "t5encoder", "umt5", "cohere", "minimax_m2"}
+        # DeepSeek V4 currently has no small representative GGUF; its 86.7 GB checkpoint
+        # is covered by the external structural and logits validation contract.
+        known_skip = {"t5", "t5encoder", "umt5", "cohere", "minimax_m2", "deepseek_v4"}
         gap = sorted(registered - covered - known_skip)
         self.assertFalse(
             gap,

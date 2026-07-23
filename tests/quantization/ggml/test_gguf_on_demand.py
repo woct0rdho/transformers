@@ -34,13 +34,17 @@ if is_torch_available():
 
     from transformers.integrations.gguf import (
         ALL_GGUF_EXPERTS_FUNCTIONS,
+        DeepseekV4GGUFExperts,
         GGUFEmbedding,
         GGUFExperts,
+        GGUFGroupedLinear,
         GGUFLinear,
         replace_with_gguf_modules,
     )
     from transformers.integrations.gguf_dequant import GGUFQuantizedTensor, dequantize_gguf_tensor
     from transformers.integrations.moe import use_experts_implementation
+    from transformers.models.deepseek_v4 import DeepseekV4Config, DeepseekV4ForCausalLM
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts, DeepseekV4GroupedLinear
     from transformers.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
     from transformers.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5TextConfig
     from transformers.models.qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextConfig
@@ -106,6 +110,13 @@ class GGUFOnDemandTests(unittest.TestCase):
             GGUFQuantizedTensor(torch.empty(4, dtype=torch.uint8), requires_grad=True)
         with self.assertRaisesRegex(TypeError, "must use torch.uint8 storage"):
             GGUFQuantizedTensor(torch.empty(4, dtype=torch.float32))
+
+    def test_i32_is_an_ordinary_gguf_tensor_type(self):
+        from transformers.modeling_gguf_pytorch_utils import _is_gguf_ordinary_tensor_type
+
+        self.assertTrue(_is_gguf_ordinary_tensor_type(gguf.GGMLQuantizationType.I32, gguf.GGMLQuantizationType))
+        self.assertTrue(_is_gguf_ordinary_tensor_type(gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType))
+        self.assertFalse(_is_gguf_ordinary_tensor_type(gguf.GGMLQuantizationType.Q8_0, gguf.GGMLQuantizationType))
 
     def test_quantized_tensor_movement_preserves_storage_and_metadata(self):
         tensor = GGUFQuantizedTensor(
@@ -221,6 +232,36 @@ class GGUFOnDemandTests(unittest.TestCase):
         assert linear.bias is not None and linear.bias.grad is not None and reference_bias.grad is not None
         torch.testing.assert_close(linear.bias.grad, reference_bias.grad)
         self.assertIsNone(linear.weight.grad)
+
+    def test_deepseek_grouped_linear_replacement_preserves_forward_and_backward(self):
+        torch.manual_seed(0)
+        source = DeepseekV4GroupedLinear(4, 6, 2, bias=False)
+        source_weight = source.weight.detach().clone()
+        container = torch.nn.Module()
+        container.config = SimpleNamespace(model_type="deepseek_v4")
+        container.projection = source
+        replace_with_gguf_modules(container, compute_dtype=torch.float32)
+        grouped: Any = container.projection
+        self.assertIsInstance(grouped, GGUFGroupedLinear)
+        self.assertEqual(grouped.n_groups, 2)
+
+        grouped.weight = GGUFQuantizedTensor(
+            torch.from_numpy(_float_bytes(source_weight)),
+            quant_type=gguf.GGMLQuantizationType.F32,
+            logical_shape=source_weight.shape,
+        )
+        inputs = torch.randn(2, 3, 2, 4, requires_grad=True)
+        reference_inputs = inputs.detach().clone().requires_grad_(True)
+        actual = grouped(inputs)
+        expected = source(reference_inputs)
+        torch.testing.assert_close(actual, expected)
+
+        grad_output = torch.randn_like(actual)
+        actual.backward(grad_output)
+        expected.backward(grad_output)
+        assert inputs.grad is not None and reference_inputs.grad is not None
+        torch.testing.assert_close(inputs.grad, reference_inputs.grad)
+        self.assertIsNone(grouped.weight.grad)
 
     def test_linear_layout_permutations_preserve_outputs_and_input_gradients(self):
         torch.manual_seed(0)
@@ -443,6 +484,115 @@ class GGUFOnDemandTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "projection bias"):
             replace_with_gguf_modules(incompatible_container)
         self.assertIs(type(incompatible_container.linear), torch.nn.Linear)
+
+    def test_deepseek_expert_replacement_preserves_clamped_split_gate(self):
+        torch.manual_seed(0)
+        config = DeepseekV4Config(
+            vocab_size=16,
+            hidden_size=8,
+            moe_intermediate_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+            q_lora_rank=4,
+            num_experts_per_tok=2,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            swiglu_limit=2.0,
+            layer_types=["sliding_attention"],
+            mlp_layer_types=["moe"],
+            o_groups=2,
+            o_lora_rank=2,
+        )
+        source = DeepseekV4Experts(config)
+        torch.nn.init.normal_(source.gate_up_proj)
+        torch.nn.init.normal_(source.down_proj)
+        source_gate_up = source.gate_up_proj.detach().clone()
+        source_down = source.down_proj.detach().clone()
+        container = torch.nn.Module()
+        container.config = config
+        container.experts = source
+        replace_with_gguf_modules(container, compute_dtype=torch.float32)
+        replacement: Any = container.experts
+        self.assertIsInstance(replacement, DeepseekV4GGUFExperts)
+
+        gate, up = source_gate_up.chunk(2, dim=1)
+        for name, weight in (("gate_proj", gate), ("up_proj", up), ("down_proj", source_down)):
+            setattr(
+                replacement,
+                name,
+                GGUFQuantizedTensor(
+                    torch.from_numpy(_float_bytes(weight)),
+                    quant_type=gguf.GGMLQuantizationType.F32,
+                    logical_shape=weight.shape,
+                ),
+            )
+
+        gate_values = torch.tensor([[-3.0, 3.0]])
+        up_values = torch.tensor([[-3.0, 3.0]])
+        expected_gate = F.silu(gate_values.clamp(max=2.0)) * up_values.clamp(-2.0, 2.0)
+        torch.testing.assert_close(replacement._apply_split_gate(gate_values, up_values), expected_gate)
+
+        hidden_states = torch.randn(5, 8) * 4
+        top_k_index = torch.tensor([[0, 1], [2, 3], [1, 2], [3, 0], [2, 0]])
+        top_k_weights = torch.rand(5, 2)
+        top_k_weights /= top_k_weights.sum(dim=-1, keepdim=True)
+        for implementation in ("eager", "grouped_mm", "batched_mm"):
+            with self.subTest(implementation=implementation):
+                config._experts_implementation_internal = implementation
+                actual = replacement(hidden_states, top_k_index, top_k_weights)
+                expected = source(hidden_states, top_k_index, top_k_weights)
+                torch.testing.assert_close(actual, expected)
+
+    def test_tiny_deepseek_model_uses_persistent_grouped_and_expert_modules(self):
+        config = DeepseekV4Config(
+            vocab_size=16,
+            hidden_size=8,
+            moe_intermediate_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+            q_lora_rank=4,
+            num_experts_per_tok=2,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            swiglu_limit=2.0,
+            layer_types=["sliding_attention"],
+            mlp_layer_types=["hash_moe"],
+            o_groups=2,
+            o_lora_rank=2,
+            hc_mult=2,
+            max_position_embeddings=32,
+            sliding_window=8,
+        )
+        with torch.device("meta"):
+            model = DeepseekV4ForCausalLM(config)
+        from transformers.core_model_loading import WeightRenaming
+        from transformers.modeling_gguf_pytorch_utils import get_gguf_converters
+
+        weight_mapping = get_gguf_converters("deepseek_v4")
+        quantizer = GGUFQuantizer(GGUFConfig(architecture="deepseek_v4"), weight_mapping=weight_mapping)
+        self.assertTrue(quantizer.persistent)
+        quantizer.update_dtype(torch.bfloat16)
+        quantizer.preprocess_model(model, dtype=torch.bfloat16, device_map={"": "cpu"})
+        conversions = quantizer.update_weight_conversions([])
+        expert_renamings = {
+            source: rule.target_patterns[0]
+            for rule in conversions
+            if isinstance(rule, WeightRenaming)
+            for source in rule.source_patterns
+            if "ffn_gate_exps" in source or "ffn_up_exps" in source
+        }
+
+        self.assertEqual(expert_renamings[r"\.ffn_gate_exps\.weight"], ".mlp.experts.gate_proj")
+        self.assertEqual(expert_renamings[r"\.ffn_up_exps\.weight"], ".mlp.experts.up_proj")
+        self.assertIsInstance(model.model.layers[0].self_attn.o_a_proj, GGUFGroupedLinear)
+        self.assertIsInstance(model.model.layers[0].self_attn.o_b_proj, GGUFLinear)
+        self.assertIsInstance(model.model.layers[0].mlp.experts, DeepseekV4GGUFExperts)
+        self.assertEqual(model.model.layers[0].mlp.gate.tid2eid.dtype, torch.long)
+        self.assertEqual(model.model.layers[0].mlp.gate.tid2eid.shape, (16, 2))
 
     def test_gguf_module_factories_preserve_structure_and_meta_device(self):
         source_linear = torch.nn.Linear(4, 3, bias=True, device="meta", dtype=torch.bfloat16)

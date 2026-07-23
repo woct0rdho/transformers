@@ -46,6 +46,7 @@ class GGUFQuantizer(HfQuantizer):
             "qwen3_moe",
             "qwen3_5_text",
             "qwen3_5_moe_text",
+            "deepseek_v4",
         }
         self.compute_dtype = None
         self.weight_mapping = list(weight_mapping or [])
@@ -60,7 +61,7 @@ class GGUFQuantizer(HfQuantizer):
     def validate_environment(self, *args, **kwargs):
         if self.quantization_config.architecture and not self.persistent:
             logger.warning_once(
-                f"Persistent GGUF weights currently support Qwen3, Qwen3-MoE, and Qwen3.5 text models; "
+                f"Persistent GGUF weights currently support Qwen3, Qwen3-MoE, Qwen3.5 text, and DeepSeek V4; "
                 f"{self.quantization_config.architecture!r} will use load-time dequantization."
             )
 

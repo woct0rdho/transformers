@@ -371,6 +371,47 @@ if is_torch_available():
         ),
     ]
 
+    # --- DeepSeek V4 (CSA/HCA + hyper-connections + split routed experts) ------
+    _DEEPSEEK_V4_CONVERTERS = [
+        _BLK_PREFIX,
+        WeightRenaming(r"^token_embd\.weight", "model.embed_tokens.weight"),
+        WeightRenaming(r"^output_norm\.weight", "model.norm.weight"),
+        WeightRenaming(r"^output\.weight", "lm_head.weight"),
+        WeightRenaming(r"^output_hc_fn\.weight", "model.hc_head.hc_fn"),
+        WeightRenaming(r"^output_hc_base\.weight", "model.hc_head.hc_base"),
+        WeightRenaming(r"^output_hc_scale\.weight", "model.hc_head.hc_scale"),
+        WeightRenaming(r"\.attn_norm\.weight", ".input_layernorm.weight"),
+        WeightRenaming(r"\.ffn_norm\.weight", ".post_attention_layernorm.weight"),
+        WeightRenaming(r"\.hc_attn_(fn|base|scale)\.weight", r".attn_hc.\1"),
+        WeightRenaming(r"\.hc_ffn_(fn|base|scale)\.weight", r".ffn_hc.\1"),
+        WeightRenaming(r"^(model\.layers\.\d+)\.attn_sinks\.weight", r"\1.self_attn.sinks"),
+        WeightRenaming(r"^(model\.layers\.\d+)\.attn_q_a\.weight", r"\1.self_attn.q_a_proj.weight"),
+        WeightRenaming(r"^(model\.layers\.\d+)\.attn_q_a_norm\.weight", r"\1.self_attn.q_a_norm.weight"),
+        WeightRenaming(r"^(model\.layers\.\d+)\.attn_q_b\.weight", r"\1.self_attn.q_b_proj.weight"),
+        WeightRenaming(r"^(model\.layers\.\d+)\.attn_kv\.weight", r"\1.self_attn.kv_proj.weight"),
+        WeightRenaming(r"^(model\.layers\.\d+)\.attn_kv_a_norm\.weight", r"\1.self_attn.kv_norm.weight"),
+        WeightRenaming(r"^(model\.layers\.\d+)\.attn_output_a\.weight", r"\1.self_attn.o_a_proj.weight"),
+        WeightRenaming(r"^(model\.layers\.\d+)\.attn_output_b\.weight", r"\1.self_attn.o_b_proj.weight"),
+        WeightRenaming(r"\.attn_compressor_ape\.weight", ".self_attn.compressor.position_bias"),
+        WeightRenaming(r"\.attn_compressor_(kv|gate)\.weight", r".self_attn.compressor.\1_proj.weight"),
+        WeightRenaming(r"\.attn_compressor_norm\.weight", ".self_attn.compressor.kv_norm.weight"),
+        WeightRenaming(r"\.indexer\.attn_q_b\.weight", ".self_attn.compressor.indexer.q_b_proj.weight"),
+        WeightRenaming(r"\.indexer\.proj\.weight", ".self_attn.compressor.indexer.scorer.weights_proj.weight"),
+        WeightRenaming(r"\.indexer_compressor_ape\.weight", ".self_attn.compressor.indexer.position_bias"),
+        WeightRenaming(r"\.indexer_compressor_(kv|gate)\.weight", r".self_attn.compressor.indexer.\1_proj.weight"),
+        WeightRenaming(r"\.indexer_compressor_norm\.weight", ".self_attn.compressor.indexer.kv_norm.weight"),
+        WeightRenaming(r"\.ffn_gate_inp\.weight", ".mlp.gate.weight"),
+        WeightRenaming(r"\.ffn_gate_tid2eid\.weight", ".mlp.gate.tid2eid"),
+        WeightRenaming(r"\.exp_probs_b\.bias", ".mlp.gate.e_score_correction_bias"),
+        WeightRenaming(r"\.ffn_(gate|up|down)_shexp\.weight", r".mlp.shared_experts.\1_proj.weight"),
+        WeightRenaming(r"\.ffn_down_exps\.weight", ".mlp.experts.down_proj"),
+        WeightConverter(
+            source_patterns=[r"\.ffn_gate_exps\.weight", r"\.ffn_up_exps\.weight"],
+            target_patterns=".mlp.experts.gate_up_proj",
+            operations=[Concatenate(dim=1)],
+        ),
+    ]
+
     # --- Bloom -----------------------------------------------------------------
     _BLOOM_CONVERTERS = [
         _BLK_PREFIX,
@@ -486,6 +527,7 @@ if is_torch_available():
         "qwen2_moe": _QWEN2_MOE_CONVERTERS,
         "qwen3_moe": _QWEN3_MOE_CONVERTERS,
         "qwen3_5_moe_text": _QWEN35_MOE_CONVERTERS,
+        "deepseek_v4": _DEEPSEEK_V4_CONVERTERS,
         "minimax_m2": _MINIMAX_M2_CONVERTERS,
         "gpt_oss": _GPT_OSS_CONVERTERS,
         # T5 / UMT5 / T5-encoder share the same encoder–decoder mapping
@@ -505,6 +547,14 @@ def read_field(reader, field):
         return []
     value = reader.fields[field]
     return [_gguf_parse_value(value.parts[_data_index], value.types) for _data_index in value.data]
+
+
+def _is_gguf_ordinary_tensor_type(tensor_type, ggml_quantization_type):
+    return tensor_type in {
+        ggml_quantization_type.F16,
+        ggml_quantization_type.F32,
+        ggml_quantization_type.I32,
+    }
 
 
 def _postprocess_qwen35_config(config):
@@ -596,6 +646,155 @@ def _postprocess_qwen35_config(config):
         ]
 
 
+def _postprocess_deepseek_v4_config(config):
+    """Build a native DeepSeek V4 config from llama.cpp's GGUF metadata."""
+
+    def pop_required(key):
+        if key not in config:
+            raise ValueError(f"DeepSeek V4 GGUF metadata is missing required field {key!r}")
+        return config.pop(key)
+
+    def require_positive(key):
+        value = int(pop_required(key))
+        if value <= 0:
+            raise ValueError(f"DeepSeek V4 GGUF {key} must be positive, got {value}")
+        config[key] = value
+        return value
+
+    num_hidden_layers = require_positive("num_hidden_layers")
+    head_dim = require_positive("head_dim")
+    value_length = int(pop_required("_gguf_attention_value_length"))
+    if value_length != head_dim:
+        raise ValueError(
+            f"DeepSeek V4 GGUF attention key and value dimensions must match, got {head_dim} and {value_length}"
+        )
+
+    for key in (
+        "hidden_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "q_lora_rank",
+        "o_lora_rank",
+        "o_groups",
+        "n_routed_experts",
+        "num_experts_per_tok",
+        "n_shared_experts",
+        "moe_intermediate_size",
+        "sliding_window",
+        "index_n_heads",
+        "index_head_dim",
+        "index_topk",
+        "hc_mult",
+        "hc_sinkhorn_iters",
+    ):
+        require_positive(key)
+
+    if config["num_key_value_heads"] != 1:
+        raise ValueError(f"DeepSeek V4 GGUF loading requires one shared KV head, got {config['num_key_value_heads']}")
+    if config["num_attention_heads"] % config["o_groups"]:
+        raise ValueError(
+            "DeepSeek V4 GGUF attention head count must be divisible by output group count, got "
+            f"{config['num_attention_heads']} and {config['o_groups']}"
+        )
+    if config["num_experts_per_tok"] > config["n_routed_experts"]:
+        raise ValueError(
+            "DeepSeek V4 GGUF experts per token cannot exceed the routed expert count, got "
+            f"{config['num_experts_per_tok']} and {config['n_routed_experts']}"
+        )
+    if config["n_shared_experts"] != 1:
+        raise ValueError(
+            f"DeepSeek V4 GGUF loading currently requires one shared expert, got {config['n_shared_experts']}"
+        )
+
+    rope_dimension_count = int(pop_required("_gguf_rope_dimension_count"))
+    if not 0 < rope_dimension_count <= head_dim:
+        raise ValueError(
+            f"DeepSeek V4 GGUF RoPE dimension count {rope_dimension_count} must be in the range (0, {head_dim}]"
+        )
+    config["partial_rotary_factor"] = rope_dimension_count / head_dim
+
+    compress_ratios = pop_required("_gguf_attention_compress_ratios")
+    if not isinstance(compress_ratios, list):
+        compress_ratios = [compress_ratios]
+    if len(compress_ratios) < num_hidden_layers:
+        raise ValueError(
+            f"DeepSeek V4 GGUF compression metadata has {len(compress_ratios)} entries, "
+            f"expected at least {num_hidden_layers}"
+        )
+    compress_ratios = [int(ratio) for ratio in compress_ratios[:num_hidden_layers]]
+    ratio_to_layer_type = {
+        0: "sliding_attention",
+        4: "compressed_sparse_attention",
+        128: "heavily_compressed_attention",
+    }
+    unsupported_ratios = sorted(set(compress_ratios).difference(ratio_to_layer_type))
+    if unsupported_ratios:
+        raise ValueError(f"DeepSeek V4 GGUF has unsupported attention compression ratios {unsupported_ratios}")
+    config["layer_types"] = [ratio_to_layer_type[ratio] for ratio in compress_ratios]
+    config["compress_rates"] = {
+        layer_type: ratio for ratio, layer_type in ratio_to_layer_type.items() if ratio and ratio in compress_ratios
+    }
+
+    num_hash_layers = int(pop_required("_gguf_hash_layer_count"))
+    if not 0 <= num_hash_layers <= num_hidden_layers:
+        raise ValueError(f"DeepSeek V4 GGUF hash layer count {num_hash_layers} must be in [0, {num_hidden_layers}]")
+    config["mlp_layer_types"] = ["hash_moe"] * num_hash_layers + ["moe"] * (num_hidden_layers - num_hash_layers)
+
+    clamp_values = pop_required("_gguf_swiglu_clamp_exp")
+    if not isinstance(clamp_values, list):
+        clamp_values = [clamp_values]
+    if len(clamp_values) < num_hidden_layers:
+        raise ValueError(
+            f"DeepSeek V4 GGUF routed SwiGLU clamp metadata has {len(clamp_values)} entries, "
+            f"expected at least {num_hidden_layers}"
+        )
+    clamp_values = [float(value) for value in clamp_values[:num_hidden_layers]]
+    if clamp_values[0] <= 0 or any(value != clamp_values[0] for value in clamp_values[1:]):
+        raise ValueError(f"DeepSeek V4 GGUF requires one positive routed SwiGLU clamp, got {clamp_values}")
+    shared_clamps = config.pop("_gguf_swiglu_clamp_shexp", None)
+    if shared_clamps is not None:
+        if not isinstance(shared_clamps, list):
+            shared_clamps = [shared_clamps]
+        if len(shared_clamps) < num_hidden_layers or any(
+            float(value) != clamp_values[0] for value in shared_clamps[:num_hidden_layers]
+        ):
+            raise ValueError("DeepSeek V4 GGUF shared-expert SwiGLU clamps must match the routed expert clamp")
+    config["swiglu_limit"] = clamp_values[0]
+
+    gating_func = int(pop_required("_gguf_expert_gating_func"))
+    if gating_func != 4:
+        raise ValueError(f"DeepSeek V4 GGUF requires sqrtsoftplus expert gating enum 4, got {gating_func}")
+    config["scoring_func"] = "sqrtsoftplus"
+
+    rope_scaling_type = str(config.pop("_gguf_rope_scaling_type", "none"))
+    partial_rotary_factor = config["partial_rotary_factor"]
+    config["rope_parameters"] = {
+        "main": {
+            "rope_type": "default",
+            "rope_theta": float(config["rope_theta"]),
+            "partial_rotary_factor": partial_rotary_factor,
+        },
+        "compress": {
+            "rope_type": "default",
+            "rope_theta": float(config["compress_rope_theta"]),
+            "partial_rotary_factor": partial_rotary_factor,
+        },
+    }
+    if rope_scaling_type == "yarn":
+        config["rope_parameters"]["compress"].update(
+            {
+                "rope_type": "yarn",
+                "factor": float(pop_required("_gguf_rope_scaling_factor")),
+                "original_max_position_embeddings": int(pop_required("_gguf_rope_scaling_original_context_length")),
+                "beta_fast": float(pop_required("_gguf_rope_scaling_beta_fast")),
+                "beta_slow": float(pop_required("_gguf_rope_scaling_beta_slow")),
+                "attention_factor": 1.0,
+            }
+        )
+    elif rope_scaling_type not in {"none", "default"}:
+        raise ValueError(f"DeepSeek V4 GGUF has unsupported RoPE scaling type {rope_scaling_type!r}")
+
+
 def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
     """
     Load a GGUF file and return a dictionary of parsed parameters containing tensors, the parsed
@@ -655,6 +854,8 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
         updated_architecture = "qwen3_5_text"
     elif architecture == "qwen35moe":
         updated_architecture = "qwen3_5_moe_text"
+    elif architecture == "deepseek4":
+        updated_architecture = "deepseek_v4"
 
     # For stablelm architecture, we need to set qkv_bias and use_parallel_residual from tensors
     # If `qkv_bias=True`, qkv_proj with bias will be present in the tensors
@@ -716,6 +917,8 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
 
     if parsed_parameters["config"]["model_type"] in {"qwen3_5_text", "qwen3_5_moe_text"}:
         _postprocess_qwen35_config(parsed_parameters["config"])
+    elif parsed_parameters["config"]["model_type"] == "deepseek_v4":
+        _postprocess_deepseek_v4_config(parsed_parameters["config"])
 
     # Gemma3 GGUF checkpoint only contains weights of text backbone
     if parsed_parameters["config"]["model_type"] == "gemma3":
@@ -788,7 +991,7 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
         config = parsed_parameters.get("config", {})
         model_type = config.get("model_type", architecture)
 
-        # Keep compressed payloads in a metadata-carrying tensor subclass; F16/F32 values follow normal loading.
+        # Keep compressed payloads in a metadata-carrying tensor subclass; floating and integer values load normally.
         import warnings
 
         import torch  # local: keep top-of-file import-light when torch isn't required
@@ -802,11 +1005,10 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False):
         # fly (or don't store as a parameter). Skip so they don't show up as "unexpected".
         _GGUF_RUNTIME_AUX_TENSORS = frozenset({"rope_freqs.weight"})
 
-        float_types = {GGMLQuantizationType.F16, GGMLQuantizationType.F32}
         parsed_parameters["tensors"] = {
             tensor.name: (
                 as_torch_tensor(tensor.data)
-                if tensor.tensor_type in float_types
+                if _is_gguf_ordinary_tensor_type(tensor.tensor_type, GGMLQuantizationType)
                 else GGUFQuantizedTensor(
                     as_torch_tensor(tensor.data),
                     quant_type=tensor.tensor_type,

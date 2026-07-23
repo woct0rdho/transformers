@@ -264,6 +264,78 @@ class _GGUFLinearFunction(torch.autograd.Function):
         return grad_input, None, grad_bias, None
 
 
+def _run_grouped_linear(input: torch.Tensor, weight: torch.Tensor, n_groups: int) -> torch.Tensor:
+    if input.ndim < 2 or input.shape[-2] != n_groups:
+        raise RuntimeError(
+            f"GGUF grouped linear expected a group dimension of {n_groups}, got input shape {tuple(input.shape)}"
+        )
+    if weight.ndim != 2 or weight.shape[1] != input.shape[-1] or weight.shape[0] % n_groups:
+        raise RuntimeError(
+            f"GGUF grouped linear weight shape {tuple(weight.shape)} is incompatible with input shape "
+            f"{tuple(input.shape)} and {n_groups} groups"
+        )
+
+    input_shape = input.shape[:-2]
+    in_features = input.shape[-1]
+    grouped_weight = weight.view(n_groups, -1, in_features)
+    flat_input = input.reshape(-1, n_groups, in_features).transpose(0, 1)
+    output = torch.bmm(flat_input, grouped_weight.transpose(1, 2)).transpose(0, 1)
+    return output.reshape(*input_shape, n_groups, -1)
+
+
+def _run_grouped_linear_input_gradient(
+    grad_output: torch.Tensor,
+    weight: torch.Tensor,
+    n_groups: int,
+    input_dtype: torch.dtype,
+) -> torch.Tensor:
+    output_shape = grad_output.shape[:-2]
+    flat_grad_output = grad_output.reshape(-1, n_groups, grad_output.shape[-1]).transpose(0, 1)
+    grouped_weight = weight.view(n_groups, -1, weight.shape[-1])
+    grad_input = torch.bmm(flat_grad_output, grouped_weight).transpose(0, 1)
+    return grad_input.reshape(*output_shape, n_groups, weight.shape[-1]).to(input_dtype)
+
+
+class _GGUFGroupedLinearFunction(torch.autograd.Function):
+    """Recompute a frozen grouped GGUF weight for activation gradients."""
+
+    @staticmethod
+    def forward(ctx, input, weight, compute_dtype, n_groups):
+        _save_gguf_autocast_state(ctx, input, compute_dtype)
+        ctx.n_groups = n_groups
+        ctx.quant_type = weight.quant_type
+        if ctx.needs_input_grad[0]:
+            ctx.save_for_backward(weight.as_subclass(torch.Tensor))
+
+        dense_weight = _dequantize_weight(weight, compute_dtype, input.device)
+        return _run_grouped_linear(input, dense_weight, n_groups)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = None
+        if ctx.needs_input_grad[0]:
+            (payload,) = ctx.saved_tensors
+            with maybe_autocast(
+                ctx.device_type,
+                dtype=ctx.autocast_dtype,
+                enabled=ctx.autocast_enabled,
+            ):
+                dense_weight = dequantize_gguf_tensor(
+                    payload,
+                    ctx.quant_type,
+                    dtype=ctx.compute_dtype,
+                    device=grad_output.device,
+                )
+                grad_input = _run_grouped_linear_input_gradient(
+                    grad_output,
+                    dense_weight,
+                    ctx.n_groups,
+                    ctx.input_dtype,
+                )
+
+        return grad_input, None, None, None
+
+
 class _GGUFComputeDtypeMixin:
     """Keep compute policy separate from packed GGUF parameter storage."""
 
@@ -303,6 +375,8 @@ ALL_GGUF_EXPERTS_FUNCTIONS = GGUFExpertsInterface()
 )
 class GGUFExperts(_GGUFComputeDtypeMixin, nn.Module):
     """Routed experts backed by separate compressed GGUF gate, up, and down payloads."""
+
+    _supported_source_gate_implementations = frozenset({"default"})
 
     def _prepare_expert_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states.to(self.compute_dtype)
@@ -433,7 +507,7 @@ class GGUFExperts(_GGUFComputeDtypeMixin, nn.Module):
         if gate_implementation is None:
             source_apply_gate = getattr(type(module), "_apply_gate", None)
             gate_implementation = "default" if source_apply_gate in (None, _default_apply_gate) else "custom"
-        if gate_implementation != "default":
+        if gate_implementation not in cls._supported_source_gate_implementations:
             raise ValueError("GGUF expert replacement does not yet support custom gate behavior")
 
         projections = _expert_projection_tensors(module)
@@ -549,6 +623,21 @@ class GGUFExperts(_GGUFComputeDtypeMixin, nn.Module):
             final_hidden_states.index_add_(0, token_idx, output.to(final_hidden_states.dtype))
 
         return final_hidden_states
+
+
+class DeepseekV4GGUFExperts(GGUFExperts):
+    """DeepSeek V4 packed experts with the model's clamped split SwiGLU contract."""
+
+    _supported_source_gate_implementations = frozenset({"custom"})
+
+    def __init__(self, config, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+        self.limit = config.swiglu_limit
+
+    def _apply_split_gate(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        gate = gate.clamp(max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        return self.act_fn(gate) * up
 
 
 class GGUFLinear(_GGUFComputeDtypeMixin, nn.Linear):
@@ -702,6 +791,65 @@ class GGUFLinear(_GGUFComputeDtypeMixin, nn.Linear):
                 output = F.linear(compute_input, weight, bias)
             output = output.to(input_dtype)
         return self._permute_segment(output, self.output_permutation, self.output_permutation_offset, "output")
+
+
+class GGUFGroupedLinear(GGUFLinear):
+    """Packed block-diagonal grouped linear used by DeepSeek V4's output projection."""
+
+    def __init__(
+        self, in_features, out_features, n_groups, device=None, dtype=None, compute_dtype=None, floating_weight=False
+    ):
+        if not isinstance(n_groups, int) or n_groups <= 0 or out_features % n_groups:
+            raise ValueError(
+                f"GGUF grouped linear requires a positive group count dividing out_features, got "
+                f"{n_groups} and {out_features}"
+            )
+        super().__init__(
+            in_features,
+            out_features,
+            bias=False,
+            device=device,
+            dtype=dtype,
+            compute_dtype=compute_dtype,
+            floating_weight=floating_weight,
+        )
+        self.n_groups = n_groups
+
+    @classmethod
+    def from_grouped_linear(cls, module: nn.Linear, compute_dtype=None, floating_weight=False):
+        if module.bias is not None:
+            raise ValueError("GGUF grouped linear replacement does not support bias")
+        return cls(
+            module.in_features,
+            module.out_features,
+            module.n_groups,
+            device=module.weight.device,
+            dtype=module.weight.dtype,
+            compute_dtype=compute_dtype or module.weight.dtype,
+            floating_weight=floating_weight,
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if not isinstance(self.weight, GGUFQuantizedTensor):
+            if not self.weight.is_floating_point():
+                raise RuntimeError(
+                    "GGUFGroupedLinear weight has not been loaded with a packed or floating-point parameter"
+                )
+            return _run_grouped_linear(input, self.weight, self.n_groups)
+
+        input_dtype = input.dtype
+        compute_input = input.to(self.compute_dtype)
+        if torch.is_grad_enabled() and compute_input.requires_grad:
+            output = _GGUFGroupedLinearFunction.apply(
+                compute_input,
+                self.weight,
+                self.compute_dtype,
+                self.n_groups,
+            )
+        else:
+            weight = _dequantize_weight(self.weight, self.compute_dtype, input.device)
+            output = _run_grouped_linear(compute_input, weight, self.n_groups)
+        return output.to(input_dtype)
 
 
 class GGUFEmbedding(_GGUFComputeDtypeMixin, nn.Embedding):
@@ -888,6 +1036,11 @@ def replace_with_gguf_modules(model, compute_dtype=None, floating_checkpoint_par
     """Replace linear, embedding, and structurally compatible routed-expert modules on the meta model."""
     floating_checkpoint_params = set(floating_checkpoint_params or ())
     modules = list(model.named_modules())
+    experts_class = (
+        DeepseekV4GGUFExperts
+        if getattr(getattr(model, "config", None), "model_type", None) == "deepseek_v4"
+        else GGUFExperts
+    )
     for name, module in modules:
         if not name:
             continue
@@ -898,8 +1051,8 @@ def replace_with_gguf_modules(model, compute_dtype=None, floating_checkpoint_par
         if isinstance(module, GGUFExperts):
             module._validate_supported_experts_implementation(getattr(module.config, "_experts_implementation", None))
         elif _is_expert_module_candidate(name, module):
-            GGUFExperts._source_module_contract(module)
-            GGUFExperts._validate_supported_experts_implementation(
+            experts_class._source_module_contract(module)
+            experts_class._validate_supported_experts_implementation(
                 getattr(module.config, "_experts_implementation", None)
             )
 
@@ -909,7 +1062,13 @@ def replace_with_gguf_modules(model, compute_dtype=None, floating_checkpoint_par
         if isinstance(module, GGUFLinear | GGUFEmbedding | GGUFExperts):
             continue
         if _is_expert_module_candidate(name, module):
-            replacement = GGUFExperts.from_module(module, compute_dtype=compute_dtype)
+            replacement = experts_class.from_module(module, compute_dtype=compute_dtype)
+        elif isinstance(module, nn.Linear) and hasattr(module, "n_groups"):
+            replacement = GGUFGroupedLinear.from_grouped_linear(
+                module,
+                compute_dtype=compute_dtype,
+                floating_weight=f"{name}.weight" in floating_checkpoint_params,
+            )
         elif isinstance(module, nn.Linear):
             replacement = GGUFLinear.from_linear(
                 module,
