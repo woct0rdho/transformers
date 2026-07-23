@@ -15,6 +15,8 @@ import subprocess
 import tempfile
 import unittest
 
+from parameterized import parameterized
+
 from transformers import is_torch_available
 from transformers.testing_utils import (
     backend_device_count,
@@ -139,6 +141,62 @@ class DeepseekV4ModelTest(CausalLMModelTest, unittest.TestCase):
                 self.assertIsInstance(layer_attention, torch.Tensor)
                 self.assertEqual(layer_attention.shape[0], batch_size)
                 self.assertEqual(layer_attention.shape[1], config.num_attention_heads)
+
+    @unittest.skip(
+        "V4's rotary uses per-layer-type inv_freq buffers (Gemma3 pattern); the common test calls forward without `layer_type` and reads `.inv_freq`, neither of which apply."
+    )
+    def test_model_rope_scaling_frequencies(self):
+        pass
+
+    @parameterized.expand([("linear",), ("dynamic",), ("yarn",)])
+    @unittest.skip(
+        "V4's rotary uses per-layer-type rope_parameters; the common test sets a flat dict and skips for multi-layer-type rotaries."
+    )
+    def test_model_rope_scaling_from_config(self, scaling_type):
+        pass
+
+    def test_rms_norm_restores_activation_dtype_with_fp32_weights(self):
+        from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4RMSNorm
+
+        config = self.model_tester.prepare_config_and_inputs_for_common()[0]
+        norm = DeepseekV4RMSNorm(config.hidden_size).to(dtype=torch.float32)
+        hidden_states = torch.randn(2, 3, config.hidden_size, dtype=torch.bfloat16)
+        normalized = hidden_states.float()
+        normalized = normalized * torch.rsqrt(normalized.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon)
+        expected = (norm.weight * normalized).to(torch.bfloat16)
+
+        output = norm(hidden_states)
+
+        self.assertEqual(output.dtype, torch.bfloat16)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+    def test_router_computes_fp32_logits(self):
+        from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+            DeepseekV4HashRouter,
+            DeepseekV4TopKRouter,
+        )
+
+        config = self.model_tester.prepare_config_and_inputs_for_common()[0]
+        for router_class in (DeepseekV4TopKRouter, DeepseekV4HashRouter):
+            router = router_class(config).to(dtype=torch.bfloat16)
+            for input_dtype in (torch.bfloat16, torch.float32):
+                with self.subTest(router_class=router_class.__name__, input_dtype=input_dtype):
+                    hidden_states = torch.randn(2, 3, config.hidden_size, dtype=input_dtype)
+                    expected = torch.nn.functional.linear(
+                        hidden_states.reshape(-1, config.hidden_size).float(), router.weight.float()
+                    )
+
+                    if isinstance(router, DeepseekV4HashRouter):
+                        input_ids = torch.zeros(hidden_states.shape[:-1], dtype=torch.long)
+                        router_logits, weights, indices = router(hidden_states, input_ids)
+                    else:
+                        router_logits, weights, indices = router(hidden_states)
+
+                    self.assertEqual(router_logits.dtype, torch.float32)
+                    self.assertEqual(weights.dtype, torch.float32)
+                    self.assertEqual(indices.dtype, torch.int64)
+                    torch.testing.assert_close(router_logits, expected, rtol=0, atol=0)
+                    self.assertTrue(torch.isfinite(router_logits).all())
 
     def test_hidden_states_output(self):
         # V4 layers emit a 4D ``[B, S, hc_mult, hidden]`` tensor — the hc_mult streams

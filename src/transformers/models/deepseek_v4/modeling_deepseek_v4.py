@@ -57,7 +57,8 @@ class DeepseekV4RMSNorm(nn.Module):
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        # PR #47486 tracks FP32 norm weights leaking FP32 activations; restore the dtype after multiplication.
+        return (self.weight * hidden_states).to(input_dtype)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -1034,7 +1035,8 @@ class DeepseekV4TopKRouter(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_states.reshape(-1, self.hidden_dim)
-        logits = F.linear(flat, self.weight)
+        # PR #45643 used FP32 router logits; PR #45892 removed the upcast. The reference uses FP32.
+        logits = F.linear(flat.float(), self.weight.float())
         scores = self.score_fn(logits)
         indices = torch.topk(scores + self.e_score_correction_bias, self.top_k, dim=-1, sorted=False).indices
         weights = scores.gather(1, indices)
@@ -1065,7 +1067,8 @@ class DeepseekV4HashRouter(nn.Module):
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_states.reshape(-1, self.hidden_dim)
-        logits = F.linear(flat, self.weight)
+        # PR #45643 used FP32 router logits; PR #45892 removed the upcast. The reference uses FP32.
+        logits = F.linear(flat.float(), self.weight.float())
         scores = self.score_fn(logits)
         indices = self.tid2eid[input_ids.reshape(-1)].long()
         weights = scores.gather(1, indices)
@@ -1125,23 +1128,27 @@ class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
     ) -> torch.Tensor:
         # hidden_states throughout: [B, S, hc_mult, hidden].
         # `post` / `comb` come out of the HC modules in fp32 (Sinkhorn projection runs
-        # in float); the .to(dtype) puts everything back to the input dtype before mixing
+        # in float); the .to(dtype) puts everything back to the input dtype after mixing
         # so both sites stay consistent with `hidden_states`'s entry dtype.
         # comb is consumed transposed: indexed as sum_j comb[j, k] * residual[j, d]
         # (sum over the FIRST hc axis), equivalent to comb.T @ residual. Sinkhorn
         # produces a doubly-stochastic but non-symmetric matrix, so the direction matters.
+        # PRs #45643 and #45892 introduced FP32 mHC controls; PR #46198 preserved the remaining HC params.
+        # Keep the merge in FP32 and restore the activation dtype only after mixing.
         dtype = hidden_states.dtype
         post, comb, collapsed = self.attn_hc(hidden_states)
         attn_output, _ = self.self_attn(self.input_layernorm(collapsed), **kwargs)
-        hidden_states = post.to(dtype).unsqueeze(-1) * attn_output.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), hidden_states
-        )
+        hidden_states = (
+            post.unsqueeze(-1) * attn_output.float().unsqueeze(-2)
+            + torch.matmul(comb.transpose(-1, -2), hidden_states.float())
+        ).to(dtype)
 
         post, comb, collapsed = self.ffn_hc(hidden_states)
         mlp_output = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
-        return post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), hidden_states
-        )
+        return (
+            post.unsqueeze(-1) * mlp_output.float().unsqueeze(-2)
+            + torch.matmul(comb.transpose(-1, -2), hidden_states.float())
+        ).to(dtype)
 
 
 @auto_docstring
