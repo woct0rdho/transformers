@@ -1031,23 +1031,72 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         # CODEPATH: @ArthurZucker fix flagging for no reason here
         self.eos_token_id = config.eos_token_id[0] if isinstance(config.eos_token_id, list) else config.eos_token_id
 
-        self.head_vocab_sizes = []
-        self.head_offsets = []
-        self.total_vocab_size = 0
-        for head_idx in range(self.ngram_heads):
-            global_head_idx = self.ple_layer_index * self.ngram_heads + head_idx
-            size = _find_nth_prime_after(self.ngram_vocab_size_base - 1, global_head_idx + 1)
-            self.head_vocab_sizes.append(size)
-            self.head_offsets.append(self.total_vocab_size)
-            self.total_vocab_size += size
+        configured_sizes = config.ple_head_vocab_sizes
+        configured_offsets = config.ple_head_offsets
+        if configured_sizes is None:
+            self.head_vocab_sizes = []
+            self.head_offsets = []
+            self.total_vocab_size = 0
+            for head_idx in range(self.ngram_heads):
+                global_head_idx = self.ple_layer_index * self.ngram_heads + head_idx
+                size = _find_nth_prime_after(self.ngram_vocab_size_base - 1, global_head_idx + 1)
+                self.head_vocab_sizes.append(size)
+                self.head_offsets.append(self.total_vocab_size)
+                self.total_vocab_size += size
+        else:
+            if len(configured_sizes) != self.ngram_heads:
+                raise ValueError(
+                    f"PLE metadata has {len(configured_sizes)} head vocabulary sizes, expected {self.ngram_heads}."
+                )
+            self.head_vocab_sizes = [int(size) for size in configured_sizes]
+            if any(size <= 0 for size in self.head_vocab_sizes):
+                raise ValueError("PLE head vocabulary sizes must be positive.")
+            if configured_offsets is None:
+                self.head_offsets = []
+                offset = 0
+                for size in self.head_vocab_sizes:
+                    self.head_offsets.append(offset)
+                    offset += size
+            else:
+                if len(configured_offsets) != self.ngram_heads:
+                    raise ValueError(
+                        f"PLE metadata has {len(configured_offsets)} head offsets, expected {self.ngram_heads}."
+                    )
+                self.head_offsets = [int(offset) for offset in configured_offsets]
+            expected_offsets = []
+            offset = 0
+            for size in self.head_vocab_sizes:
+                expected_offsets.append(offset)
+                offset += size
+            if self.head_offsets != expected_offsets:
+                raise ValueError("PLE head offsets must describe contiguous head ranges in row order.")
+            self.total_vocab_size = offset
 
-        self.layer_multipliers = nn.Buffer(
-            _build_layer_multipliers(self.unigram_vocab_size, self.ngram_size, self.ple_layer_index, self.seed)
-        )
+        configured_multipliers = config.ple_layer_multipliers
+        if configured_multipliers is not None:
+            if len(configured_multipliers) != self.ngram_size:
+                raise ValueError(
+                    f"PLE metadata has {len(configured_multipliers)} hash multipliers, expected {self.ngram_size}."
+                )
+            self.layer_multipliers = nn.Buffer(torch.tensor(configured_multipliers, dtype=torch.long))
+            self._uses_configured_layer_multipliers = True
+        else:
+            self.layer_multipliers = nn.Buffer(
+                _build_layer_multipliers(self.unigram_vocab_size, self.ngram_size, self.ple_layer_index, self.seed)
+            )
+            self._uses_configured_layer_multipliers = False
         self.ngram_heads_vocab_sizes = nn.Buffer(torch.tensor(self.head_vocab_sizes, dtype=torch.long))
         self.ngram_heads_offsets = nn.Buffer(torch.tensor(self.head_offsets, dtype=torch.long))
         ngram_vocab_divisor = config.make_ngram_vocab_size_divisible_by
         padded_vocab_size = math.ceil(self.total_vocab_size / ngram_vocab_divisor) * ngram_vocab_divisor
+        # CODEPATH: GGUF configs preserve the checkpoint's padded PLE table size; regular configs compute it.
+        if config.ple_vocab_size is not None:
+            # CODEPATH: GGUF configs retain the source table padding and validate it against exact head ranges.
+            if config.ple_vocab_size < self.total_vocab_size:
+                raise ValueError(
+                    f"PLE table has {config.ple_vocab_size} rows but head ranges require {self.total_vocab_size}."
+                )
+            padded_vocab_size = config.ple_vocab_size
         self.ngram_embedding = nn.Embedding(padded_vocab_size, head_dim_per_ngram)
 
     def _shift_right_ignore_eos(self, token_ids: torch.Tensor, shift: int) -> torch.Tensor:
@@ -1262,6 +1311,9 @@ class Qwen4ExpPreTrainedModel(PreTrainedModel):
     # it will lead to full model offloading, and memory OOM as accelerate tries to put cpu-offloaded params back on accelerator
     # during forward. Note that if it fits on accelerator (e.g. huge B200 gpus), then it will not be skipped, and will be put on device
     _no_placement_params = ["ple.ple_embedding.ngram_embedding.weight"]
+    _keys_to_ignore_on_load_missing = [
+        r"layers\.\d+\.ple\.ple_embedding\.(ngram_heads_vocab_sizes|ngram_heads_offsets|layer_multipliers)"
+    ]
 
     @torch.no_grad()
     def _init_weights(self, module):
@@ -1285,14 +1337,21 @@ class Qwen4ExpPreTrainedModel(PreTrainedModel):
             inv_freq = 1.0 / (module.theta ** (torch.arange(0, module.dim, 2, dtype=torch.float) / module.dim))
             init.copy_(module.inv_freq, inv_freq)
         if isinstance(module, Qwen4ExpTextNGramEmbedding):
+            if not module._uses_configured_layer_multipliers:
+                init.copy_(
+                    module.layer_multipliers,
+                    _build_layer_multipliers(
+                        module.unigram_vocab_size, module.ngram_size, module.ple_layer_index, module.seed
+                    ),
+                )
             init.copy_(
-                module.layer_multipliers,
-                _build_layer_multipliers(
-                    module.unigram_vocab_size, module.ngram_size, module.ple_layer_index, module.seed
-                ),
+                module.ngram_heads_vocab_sizes,
+                torch.tensor(module.head_vocab_sizes, dtype=torch.long, device=module.ngram_heads_vocab_sizes.device),
             )
-            init.copy_(module.ngram_heads_vocab_sizes, torch.tensor(module.head_vocab_sizes, dtype=torch.long))
-            init.copy_(module.ngram_heads_offsets, torch.tensor(module.head_offsets, dtype=torch.long))
+            init.copy_(
+                module.ngram_heads_offsets,
+                torch.tensor(module.head_offsets, dtype=torch.long, device=module.ngram_heads_offsets.device),
+            )
         elif isinstance(module, Qwen4ExpTextPLELayer):
             init.zeros_(module.conv1d.weight)
 

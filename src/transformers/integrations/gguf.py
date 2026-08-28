@@ -793,6 +793,76 @@ class GGUFLinear(_GGUFComputeDtypeMixin, nn.Linear):
         return self._permute_segment(output, self.output_permutation, self.output_permutation_offset, "output")
 
 
+class GGUFQwen4ExpIndexerLinear(nn.Module):
+    """Persistent Qwen4-Exp indexer projection backed by separate Q and K payloads."""
+
+    def __init__(
+        self,
+        in_features,
+        q_out_features,
+        k_out_features,
+        device=None,
+        dtype=None,
+        compute_dtype=None,
+        floating_q_weight=False,
+        floating_k_weight=False,
+    ):
+        super().__init__()
+        self.q_proj = GGUFLinear(
+            in_features,
+            q_out_features,
+            bias=False,
+            device=device,
+            dtype=dtype,
+            compute_dtype=compute_dtype,
+            floating_weight=floating_q_weight,
+        )
+        self.k_proj = GGUFLinear(
+            in_features,
+            k_out_features,
+            bias=False,
+            device=device,
+            dtype=dtype,
+            compute_dtype=compute_dtype,
+            floating_weight=floating_k_weight,
+        )
+
+    @classmethod
+    def from_linear(
+        cls,
+        module: nn.Linear,
+        q_out_features: int,
+        k_out_features: int,
+        compute_dtype=None,
+        floating_q_weight=False,
+        floating_k_weight=False,
+    ):
+        if module.bias is not None or module.out_features != q_out_features + k_out_features:
+            raise ValueError("Qwen4-Exp indexer projection must be bias-free with matching Q and K output sizes")
+        return cls(
+            module.in_features,
+            q_out_features,
+            k_out_features,
+            device=module.weight.device,
+            dtype=module.weight.dtype,
+            compute_dtype=compute_dtype or module.weight.dtype,
+            floating_q_weight=floating_q_weight,
+            floating_k_weight=floating_k_weight,
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return torch.cat((self.q_proj(input), self.k_proj(input)), dim=-1)
+
+    def materialize_logical_weight(self, *, dtype=None, device=None) -> torch.Tensor:
+        return torch.cat(
+            (
+                self.q_proj.materialize_logical_weight(dtype=dtype, device=device),
+                self.k_proj.materialize_logical_weight(dtype=dtype, device=device),
+            ),
+            dim=0,
+        )
+
+
 class GGUFGroupedLinear(GGUFLinear):
     """Packed block-diagonal grouped linear used by DeepSeek V4's output projection."""
 
@@ -1009,7 +1079,7 @@ def _qwen35_value_head_orders(module: nn.Module, head_dim: int):
     return physical_order, torch.argsort(physical_order)
 
 
-_QWEN35_TEXT_MODEL_TYPES = {"qwen3_5_text", "qwen3_5_moe_text"}
+_QWEN35_TEXT_MODEL_TYPES = {"qwen3_5_text", "qwen3_5_moe_text", "qwen4_exp_text"}
 
 
 def _qwen35_linear_layout(model: nn.Module, name: str):
@@ -1063,6 +1133,21 @@ def replace_with_gguf_modules(model, compute_dtype=None, floating_checkpoint_par
             continue
         if _is_expert_module_candidate(name, module):
             replacement = experts_class.from_module(module, compute_dtype=compute_dtype)
+        elif (
+            getattr(getattr(model, "config", None), "model_type", None) == "qwen4_exp_text"
+            and name.endswith(".index_qk_proj")
+            and isinstance(module, nn.Linear)
+        ):
+            q_out_features = model.config.indexer_n_heads * model.config.indexer_head_dim
+            k_out_features = model.config.indexer_kv_heads * model.config.indexer_head_dim
+            replacement = GGUFQwen4ExpIndexerLinear.from_linear(
+                module,
+                q_out_features=q_out_features,
+                k_out_features=k_out_features,
+                compute_dtype=compute_dtype,
+                floating_q_weight=f"{name}.q_proj.weight" in floating_checkpoint_params,
+                floating_k_weight=f"{name}.k_proj.weight" in floating_checkpoint_params,
+            )
         elif isinstance(module, nn.Linear) and hasattr(module, "n_groups"):
             replacement = GGUFGroupedLinear.from_grouped_linear(
                 module,

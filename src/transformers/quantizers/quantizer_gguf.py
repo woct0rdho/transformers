@@ -46,6 +46,7 @@ class GGUFQuantizer(HfQuantizer):
             "qwen3_moe",
             "qwen3_5_text",
             "qwen3_5_moe_text",
+            "qwen4_exp_text",
             "deepseek_v4",
         }
         self.compute_dtype = None
@@ -61,7 +62,7 @@ class GGUFQuantizer(HfQuantizer):
     def validate_environment(self, *args, **kwargs):
         if self.quantization_config.architecture and not self.persistent:
             logger.warning_once(
-                f"Persistent GGUF weights currently support Qwen3, Qwen3-MoE, Qwen3.5 text, and DeepSeek V4; "
+                f"Persistent GGUF weights currently support Qwen3, Qwen3-MoE, Qwen3.5 text, Qwen4-Exp text, and DeepSeek V4; "
                 f"{self.quantization_config.architecture!r} will use load-time dequantization."
             )
 
@@ -75,11 +76,17 @@ class GGUFQuantizer(HfQuantizer):
         }
         renamings = [entry for entry in self.weight_mapping if isinstance(entry, WeightRenaming)]
         converters = [entry for entry in self.weight_mapping if isinstance(entry, WeightConverter)]
-        self.floating_checkpoint_params = {
-            rename_source_key(name, renamings, converters)[0]
-            for name, tensor in checkpoint_tensors.items()
-            if tensor.is_floating_point()
-        }
+        self.floating_checkpoint_params = set()
+        for name, tensor in checkpoint_tensors.items():
+            if not tensor.is_floating_point():
+                continue
+            target_name = rename_source_key(name, renamings, converters)[0]
+            if self.quantization_config.architecture == "qwen4_exp_text":
+                if name.endswith(".indexer.q_proj.weight"):
+                    target_name = target_name.removesuffix(".weight") + ".q_proj.weight"
+                elif name.endswith(".indexer.k_proj.weight"):
+                    target_name = target_name.removesuffix(".weight") + ".k_proj.weight"
+            self.floating_checkpoint_params.add(target_name)
 
     @property
     def renaming_quantization_op(self):
@@ -105,6 +112,23 @@ class GGUFQuantizer(HfQuantizer):
                 continue
 
             sources = conversion._original_source_patterns
+            if (
+                self.persistent
+                and self.quantization_config.architecture == "qwen4_exp_text"
+                and sources
+                == [
+                    r"\.indexer\.q_proj\.weight",
+                    r"\.indexer\.k_proj\.weight",
+                ]
+            ):
+                injected.extend(
+                    [
+                        WeightRenaming(sources[0], ".self_attn.indexer.index_qk_proj.q_proj.weight"),
+                        WeightRenaming(sources[1], ".self_attn.indexer.index_qk_proj.k_proj.weight"),
+                    ]
+                )
+                continue
+
             if self.persistent and sources == [
                 r"\.ffn_gate_exps\.weight",
                 r"\.ffn_up_exps\.weight",

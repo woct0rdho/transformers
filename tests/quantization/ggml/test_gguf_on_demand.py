@@ -39,6 +39,7 @@ if is_torch_available():
         GGUFExperts,
         GGUFGroupedLinear,
         GGUFLinear,
+        GGUFQwen4ExpIndexerLinear,
         replace_with_gguf_modules,
     )
     from transformers.integrations.gguf_dequant import GGUFQuantizedTensor, dequantize_gguf_tensor
@@ -49,6 +50,7 @@ if is_torch_available():
     from transformers.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5TextConfig
     from transformers.models.qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextConfig
     from transformers.models.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM
+    from transformers.models.qwen4_exp import Qwen4ExpForCausalLM, Qwen4ExpTextConfig
     from transformers.quantizers.quantizer_gguf import GGUFQuantizer
 
 if is_gguf_available():
@@ -1031,6 +1033,81 @@ class GGUFOnDemandTests(unittest.TestCase):
         self.assertLess(model.get_memory_footprint(), logical_num_parameters * torch.finfo(torch.float32).bits // 8)
         with self.assertRaisesRegex(ValueError, "Casting a persistent GGUF model"):
             getattr(model, "to")(dtype=torch.bfloat16)
+
+    def test_qwen4_exp_indexer_keeps_packed_qk_projections_separate(self):
+        source = torch.nn.Linear(8, 12, bias=False)
+        indexer = GGUFQwen4ExpIndexerLinear.from_linear(
+            source,
+            q_out_features=8,
+            k_out_features=4,
+            compute_dtype=torch.float32,
+        )
+        q_weight = torch.arange(64, dtype=torch.float32).reshape(8, 8) / 10
+        k_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8) / 10
+        for projection, weight in ((indexer.q_proj, q_weight), (indexer.k_proj, k_weight)):
+            projection.weight = GGUFQuantizedTensor(
+                torch.from_numpy(_float_bytes(weight)),
+                quant_type=gguf.GGMLQuantizationType.F32,
+                logical_shape=weight.shape,
+            )
+
+        self.assertIsInstance(indexer.q_proj.weight, GGUFQuantizedTensor)
+        self.assertIsInstance(indexer.k_proj.weight, GGUFQuantizedTensor)
+        self.assertEqual(indexer.q_proj.weight.logical_shape, (8, 8))
+        self.assertEqual(indexer.k_proj.weight.logical_shape, (4, 8))
+        torch.testing.assert_close(indexer.materialize_logical_weight(), torch.cat((q_weight, k_weight), dim=0))
+
+        inputs = torch.randn(2, 8)
+        expected = F.linear(inputs, torch.cat((q_weight, k_weight), dim=0))
+        torch.testing.assert_close(indexer(inputs), expected)
+
+    def test_qwen4_exp_ple_metadata_initializes_runtime_buffers(self):
+        config = Qwen4ExpTextConfig(
+            vocab_size=16,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+            linear_conv_kernel_dim=2,
+            linear_key_head_dim=2,
+            linear_value_head_dim=2,
+            linear_num_key_heads=1,
+            linear_num_value_heads=2,
+            layer_types=["linear_attention"],
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 10000.0,
+                "partial_rotary_factor": 0.5,
+                "mrope_section": [1, 1, 0],
+                "mrope_interleaved": True,
+            },
+            hc_count=2,
+            hc_lowrank=4,
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=4,
+            shared_expert_intermediate_size=4,
+            ple_layer_ids=[1],
+            ple_embed_dim=12,
+            ngram_size=3,
+            heads_per_ngram=2,
+            ple_head_vocab_sizes=[5, 6, 7, 8],
+            ple_head_offsets=[0, 5, 11, 18],
+            ple_layer_multipliers=[17, 19, 23],
+            ple_vocab_size=40,
+            eos_token_id=1,
+            bos_token_id=0,
+            pad_token_id=0,
+        )
+        model = Qwen4ExpForCausalLM(config)
+        embedding = model.model.layers[0].ple.ple_embedding
+
+        self.assertEqual(embedding.ngram_embedding.weight.shape, (40, 3))
+        torch.testing.assert_close(embedding.ngram_heads_vocab_sizes, torch.tensor([5, 6, 7, 8]))
+        torch.testing.assert_close(embedding.ngram_heads_offsets, torch.tensor([0, 5, 11, 18]))
+        torch.testing.assert_close(embedding.layer_multipliers, torch.tensor([17, 19, 23]))
 
     def test_tiny_qwen3_forward_and_generation_after_persistent_replacement(self):
         torch.manual_seed(0)
