@@ -376,6 +376,72 @@ if is_torch_available():
         ),
     ]
 
+    # --- Qwen4-Exp (hyper-connections + QSA indexer + PLE) ----------------------
+    _QWEN4EXP_CONVERTERS = _QWEN35_MOE_CONVERTERS + [
+        WeightConverter(
+            source_patterns=r"^output_hc_norm\.weight",
+            target_patterns="model.hyper_connection_mixer.hc_norm.weight",
+            operations=[SubtractOne()],
+        ),
+        WeightRenaming(r"^output_hc_down\.weight", "model.hyper_connection_mixer.input_mix_weight_down.weight"),
+        WeightRenaming(r"^output_hc_up\.weight", "model.hyper_connection_mixer.input_mix_weight_up.weight"),
+        WeightConverter(
+            source_patterns=r"\.hc_attn_norm\.weight",
+            target_patterns=".attn_hyper_connection.hc_norm.weight",
+            operations=[SubtractOne()],
+        ),
+        WeightRenaming(r"\.hc_attn_down\.weight", ".attn_hyper_connection.input_mix_weight_down.weight"),
+        WeightRenaming(r"\.hc_attn_up\.weight", ".attn_hyper_connection.input_mix_weight_up.weight"),
+        WeightRenaming(r"\.hc_attn_inject\.weight", ".attn_hyper_connection.block_inject_weight.weight"),
+        WeightConverter(
+            source_patterns=r"\.hc_ffn_norm\.weight",
+            target_patterns=".mlp_hyper_connection.hc_norm.weight",
+            operations=[SubtractOne()],
+        ),
+        WeightRenaming(r"\.hc_ffn_down\.weight", ".mlp_hyper_connection.input_mix_weight_down.weight"),
+        WeightRenaming(r"\.hc_ffn_up\.weight", ".mlp_hyper_connection.input_mix_weight_up.weight"),
+        WeightRenaming(r"\.hc_ffn_inject\.weight", ".mlp_hyper_connection.block_inject_weight.weight"),
+        # The exporter stores QSA query and key projections independently. The compatibility path
+        # dequantizes them before concatenating; the persistent path rewrites this rule to two targets.
+        WeightConverter(
+            source_patterns=[r"\.indexer\.q_proj\.weight", r"\.indexer\.k_proj\.weight"],
+            target_patterns=".self_attn.indexer.index_qk_proj.weight",
+            operations=[Concatenate(dim=0)],
+        ),
+        WeightConverter(
+            source_patterns=r"\.indexer\.q_norm\.weight",
+            target_patterns=".self_attn.indexer.q_layernorm.weight",
+            operations=[SubtractOne()],
+        ),
+        WeightConverter(
+            source_patterns=r"\.indexer\.k_norm\.weight",
+            target_patterns=".self_attn.indexer.k_layernorm.weight",
+            operations=[SubtractOne()],
+        ),
+        WeightRenaming(r"\.ple_key\.weight", ".ple.key_proj.weight"),
+        WeightRenaming(r"\.ple_value\.weight", ".ple.value_proj.weight"),
+        WeightConverter(
+            source_patterns=r"\.ple_norm_key\.weight",
+            target_patterns=".ple.norm_key.weight",
+            operations=[SubtractOne()],
+        ),
+        WeightConverter(
+            source_patterns=r"\.ple_norm_query\.weight",
+            target_patterns=".ple.norm_query.weight",
+            operations=[SubtractOne()],
+        ),
+        WeightConverter(
+            source_patterns=r"\.ple_norm_conv\.weight",
+            target_patterns=".ple.norm_conv.weight",
+            operations=[SubtractOne()],
+        ),
+        WeightConverter(
+            source_patterns=r"\.ple_conv1d\.weight",
+            target_patterns=".ple.conv1d.weight",
+            operations=[Unsqueeze(1)],
+        ),
+    ]
+
     # --- DeepSeek V4 (CSA/HCA + hyper-connections + split routed experts) ------
     _DEEPSEEK_V4_CONVERTERS = [
         _BLK_PREFIX,
@@ -532,6 +598,7 @@ if is_torch_available():
         "qwen2_moe": _QWEN2_MOE_CONVERTERS,
         "qwen3_moe": _QWEN3_MOE_CONVERTERS,
         "qwen3_5_moe_text": _QWEN35_MOE_CONVERTERS,
+        "qwen4_exp_text": _QWEN4EXP_CONVERTERS,
         "deepseek_v4": _DEEPSEEK_V4_CONVERTERS,
         "minimax_m2": _MINIMAX_M2_CONVERTERS,
         "gpt_oss": _GPT_OSS_CONVERTERS,
@@ -542,9 +609,26 @@ if is_torch_available():
     }
 
 
-def get_gguf_converters(model_type: str) -> list:
-    """Return the GGUF→HF rename rules (``WeightRenaming`` / ``WeightConverter``) for a given HF model type."""
-    return list(_GGUF_ARCH_CONVERTERS.get(model_type, []))
+def get_gguf_converters(model_type: str, config=None) -> list:
+    """Return GGUF-to-HF rename rules, including the config-dependent Qwen4-Exp PLE target."""
+    converters = list(_GGUF_ARCH_CONVERTERS.get(model_type, []))
+    if model_type != "qwen4_exp_text" or config is None:
+        return converters
+
+    ple_layer_ids = (
+        config.get("ple_layer_ids", []) if isinstance(config, dict) else getattr(config, "ple_layer_ids", [])
+    )
+    if len(ple_layer_ids) > 1:
+        raise ValueError("Qwen4-Exp GGUF loading supports only one PLE layer.")
+    if ple_layer_ids:
+        layer_idx = int(ple_layer_ids[0]) - 1
+        converters.append(
+            WeightRenaming(
+                r"^per_layer_token_embd\.weight$",
+                f"model.layers.{layer_idx}.ple.ple_embedding.ngram_embedding.weight",
+            )
+        )
+    return converters
 
 
 def read_field(reader, field):
@@ -789,6 +873,246 @@ def _postprocess_qwen35_config(config):
         ]
 
 
+def _postprocess_qwen4_exp_config(config, ple_table_size=None):
+    """Build the native Qwen4-Exp text config from llama.cpp GGUF metadata."""
+    _postprocess_qwen35_config(config)
+
+    def pop_required(key):
+        if key not in config:
+            raise ValueError(f"Qwen4-Exp GGUF metadata is missing required field {key!r}")
+        return config.pop(key)
+
+    def positive(key):
+        value = int(pop_required(key))
+        if value <= 0:
+            raise ValueError(f"Qwen4-Exp GGUF {key} must be positive, got {value}")
+        config[key] = value
+        return value
+
+    positive("hc_count")
+    positive("hc_lowrank")
+    positive("indexer_n_heads")
+    positive("indexer_head_dim")
+    indexer_budget = positive("indexer_budget")
+    config["indexer_kv_heads"] = 1
+
+    ratios = config.pop("_gguf_attention_compress_ratios", None)
+    if ratios is None:
+        raise ValueError("Qwen4-Exp GGUF metadata is missing required field 'attention.compress_ratios'")
+    if not isinstance(ratios, list):
+        ratios = [ratios]
+    num_hidden_layers = int(config["num_hidden_layers"])
+    if len(ratios) != num_hidden_layers:
+        raise ValueError(
+            f"Qwen4-Exp GGUF attention.compress_ratios has {len(ratios)} entries, expected {num_hidden_layers}"
+        )
+    ratios = [int(ratio) for ratio in ratios]
+    if any(ratio < 0 for ratio in ratios):
+        raise ValueError(f"Qwen4-Exp GGUF attention.compress_ratios must be non-negative, got {ratios}")
+    full_attention_ratios = sorted({ratio for ratio in ratios if ratio > 0})
+    if len(full_attention_ratios) > 1:
+        raise ValueError(
+            "Qwen4-Exp GGUF uses one indexer compression ratio, but attention.compress_ratios contains "
+            f"{full_attention_ratios}"
+        )
+    if not full_attention_ratios:
+        raise ValueError("Qwen4-Exp GGUF metadata does not describe any QSA compression ratio")
+    config["indexer_compress_ratio"] = full_attention_ratios[0]
+    if indexer_budget % config["indexer_compress_ratio"]:
+        raise ValueError("Qwen4-Exp GGUF indexer top_k must be divisible by its compression ratio")
+    config["layer_types"] = ["qwen_sparse_attention" if ratio > 0 else "linear_attention" for ratio in ratios]
+
+    ple_layers = config.pop("_gguf_ple_layers", [])
+    if not isinstance(ple_layers, list):
+        ple_layers = [ple_layers]
+    if len(ple_layers) > 1:
+        raise ValueError("Qwen4-Exp GGUF loading supports only one PLE layer")
+    config["ple_layer_ids"] = [int(layer) + 1 for layer in ple_layers]
+    if ple_layers:
+        layer = int(ple_layers[0])
+        if not 0 <= layer < num_hidden_layers:
+            raise ValueError(f"Qwen4-Exp GGUF PLE layer {layer} is out of range")
+        if config["layer_types"][layer] != "linear_attention":
+            raise ValueError("Qwen4-Exp GGUF PLE must be attached to a recurrent layer")
+
+        ngram_size = positive("ngram_size")
+        heads_per_ngram = positive("heads_per_ngram")
+        ple_head_dim = int(pop_required("_gguf_ple_head_dim"))
+        if ple_head_dim <= 0:
+            raise ValueError(f"Qwen4-Exp GGUF _gguf_ple_head_dim must be positive, got {ple_head_dim}")
+        ngram_heads = (ngram_size - 1) * heads_per_ngram
+        config["ple_embed_dim"] = ple_head_dim * ngram_heads
+        config["eos_token_id"] = int(pop_required("_gguf_ple_eos_token_id"))
+
+        def int_array(key):
+            value = pop_required(key)
+            if not isinstance(value, list):
+                value = [value]
+            return [int(item) for item in value]
+
+        multipliers = int_array("_gguf_ple_layer_multipliers")
+        offsets = int_array("_gguf_ple_head_offsets")
+        vocab_sizes = int_array("_gguf_ple_head_vocab_sizes")
+        if len(multipliers) != ngram_size:
+            raise ValueError(f"Qwen4-Exp GGUF PLE has {len(multipliers)} hash multipliers, expected {ngram_size}")
+        if len(offsets) != ngram_heads or len(vocab_sizes) != ngram_heads:
+            raise ValueError("Qwen4-Exp GGUF PLE head metadata must contain one offset and vocabulary size per head")
+        expected_offset = 0
+        for offset, vocab_size in zip(offsets, vocab_sizes):
+            if offset != expected_offset or vocab_size <= 0:
+                raise ValueError("Qwen4-Exp GGUF PLE head ranges are not contiguous positive intervals")
+            expected_offset += vocab_size
+        config["ple_layer_multipliers"] = multipliers
+        config["ple_head_offsets"] = offsets
+        config["ple_head_vocab_sizes"] = vocab_sizes
+        if ple_table_size is not None:
+            if ple_table_size < expected_offset:
+                raise ValueError(
+                    f"Qwen4-Exp GGUF PLE table has {ple_table_size} rows, but head ranges require {expected_offset}"
+                )
+            config["ple_vocab_size"] = int(ple_table_size)
+    else:
+        for key in (
+            "_gguf_ple_head_dim",
+            "_gguf_ple_eos_token_id",
+            "_gguf_ple_layer_multipliers",
+            "_gguf_ple_head_offsets",
+            "_gguf_ple_head_vocab_sizes",
+        ):
+            config.pop(key, None)
+
+
+def _validate_single_file_gguf(reader, gguf_checkpoint_path):
+    """Reject GGUF shard files because the loader accepts one complete file only."""
+    split_count = read_field(reader, "split.count")
+    split_no = read_field(reader, "split.no")
+    split_tensor_count = read_field(reader, "split.tensors.count")
+    actual_tensor_count = len(reader.tensors)
+
+    # llama-gguf-split writes split.count=0 when it reconstructs a complete file,
+    # even though it preserves the split.* metadata keys. Treat that marker as
+    # consolidated only after checking that every declared tensor is present.
+    if split_count and int(split_count[0]) not in {0, 1}:
+        raise ValueError(
+            f"GGUF split checkpoints are not supported for {gguf_checkpoint_path!r}; "
+            "provide one consolidated GGUF file"
+        )
+    if split_count and int(split_count[0]) == 0 and not split_tensor_count:
+        raise ValueError(
+            f"GGUF file {gguf_checkpoint_path!r} declares split.count=0 without split.tensors.count; "
+            "cannot verify that it is consolidated"
+        )
+    if split_no and int(split_no[0]) != 0:
+        raise ValueError(f"GGUF file {gguf_checkpoint_path!r} is not the complete file (split.no={split_no[0]})")
+    if split_tensor_count and int(split_tensor_count[0]) != actual_tensor_count:
+        raise ValueError(
+            f"GGUF file {gguf_checkpoint_path!r} contains {actual_tensor_count} tensors, but its metadata declares "
+            f"{split_tensor_count[0]}"
+        )
+
+
+def _validate_qwen4_exp_tensor_inventory(config, tensor_names):
+    """Fail before model construction when a Qwen4-Exp tensor is missing or unknown."""
+    tensor_names = set(tensor_names)
+    expected = {
+        "token_embd.weight",
+        "output_hc_norm.weight",
+        "output_hc_down.weight",
+        "output_hc_up.weight",
+    }
+    if not config.get("tie_word_embeddings", False):
+        expected.add("output.weight")
+
+    layer_types = config["layer_types"]
+    ple_layers = {int(layer) - 1 for layer in config.get("ple_layer_ids", [])}
+    for layer_idx, layer_type in enumerate(layer_types):
+        prefix = f"blk.{layer_idx}."
+        expected.update(
+            prefix + suffix
+            for suffix in (
+                "hc_attn_norm.weight",
+                "hc_attn_down.weight",
+                "hc_attn_up.weight",
+                "hc_attn_inject.weight",
+                "hc_ffn_norm.weight",
+                "hc_ffn_down.weight",
+                "hc_ffn_up.weight",
+                "hc_ffn_inject.weight",
+                "ffn_gate_inp.weight",
+                "ffn_down_exps.weight",
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_gate_inp_shexp.weight",
+                "ffn_gate_shexp.weight",
+                "ffn_up_shexp.weight",
+                "ffn_down_shexp.weight",
+            )
+        )
+        if layer_type == "linear_attention":
+            expected.update(
+                prefix + suffix
+                for suffix in (
+                    "attn_gate.weight",
+                    "attn_qkv.weight",
+                    "ssm_a",
+                    "ssm_alpha.weight",
+                    "ssm_beta.weight",
+                    "ssm_conv1d.weight",
+                    "ssm_dt.bias",
+                    "ssm_norm.weight",
+                    "ssm_out.weight",
+                )
+            )
+        else:
+            expected.update(
+                prefix + suffix
+                for suffix in (
+                    "attn_q.weight",
+                    "attn_q_norm.weight",
+                    "attn_k.weight",
+                    "attn_k_norm.weight",
+                    "attn_v.weight",
+                    "attn_output.weight",
+                    "indexer.q_proj.weight",
+                    "indexer.k_proj.weight",
+                    "indexer.q_norm.weight",
+                    "indexer.k_norm.weight",
+                )
+            )
+        if layer_idx in ple_layers:
+            expected.update(
+                prefix + suffix
+                for suffix in (
+                    "ple_key.weight",
+                    "ple_value.weight",
+                    "ple_norm_key.weight",
+                    "ple_norm_query.weight",
+                    "ple_norm_conv.weight",
+                    "ple_conv1d.weight",
+                )
+            )
+    if ple_layers:
+        expected.add("per_layer_token_embd.weight")
+
+    missing = sorted(expected - tensor_names)
+    if missing:
+        raise ValueError(f"Qwen4-Exp GGUF is missing required tensors: {missing[:12]}")
+
+
+def _assert_qwen4_exp_source_names_mapped(tensor_names, weight_mapping):
+    from .core_model_loading import WeightConverter, WeightRenaming, rename_source_key
+
+    renamings = [entry for entry in weight_mapping if isinstance(entry, WeightRenaming)]
+    converters = [entry for entry in weight_mapping if isinstance(entry, WeightConverter)]
+    unmapped = []
+    for source_name in tensor_names:
+        renamed_name, source_pattern = rename_source_key(source_name, renamings, converters)
+        if source_pattern is None and renamed_name == source_name:
+            unmapped.append(source_name)
+    if unmapped:
+        raise ValueError(f"Qwen4-Exp GGUF has tensors without a loading rule: {sorted(unmapped)[:12]}")
+
+
 def _postprocess_deepseek_v4_config(config):
     """Build a native DeepSeek V4 config from llama.cpp's GGUF metadata."""
 
@@ -965,6 +1289,7 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, mmap_policy
         raise ImportError("Please install torch and gguf>=0.10.0 to load a GGUF checkpoint in PyTorch.")
 
     reader = GGUFReader(gguf_checkpoint_path)
+    _validate_single_file_gguf(reader, gguf_checkpoint_path)
     fields = reader.fields
     reader_keys = list(fields.keys())
 
@@ -1002,6 +1327,8 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, mmap_policy
         updated_architecture = "qwen3_5_text"
     elif architecture == "qwen35moe":
         updated_architecture = "qwen3_5_moe_text"
+    elif architecture == "qwen4exp":
+        updated_architecture = "qwen4_exp_text"
     elif architecture == "deepseek4":
         updated_architecture = "deepseek_v4"
 
@@ -1065,6 +1392,19 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, mmap_policy
 
     if parsed_parameters["config"]["model_type"] in {"qwen3_5_text", "qwen3_5_moe_text"}:
         _postprocess_qwen35_config(parsed_parameters["config"])
+    elif parsed_parameters["config"]["model_type"] == "qwen4_exp_text":
+        ple_table_size = None
+        for tensor in reader.tensors:
+            if tensor.name == "per_layer_token_embd.weight":
+                logical_shape = tuple(int(dim) for dim in reversed(tensor.shape))
+                if len(logical_shape) != 2:
+                    raise ValueError(f"Qwen4-Exp GGUF PLE embedding must be rank 2, got shape {logical_shape}")
+                ple_table_size = logical_shape[0]
+                break
+        _postprocess_qwen4_exp_config(parsed_parameters["config"], ple_table_size=ple_table_size)
+        weight_mapping = get_gguf_converters("qwen4_exp_text", parsed_parameters["config"])
+        _validate_qwen4_exp_tensor_inventory(parsed_parameters["config"], [tensor.name for tensor in reader.tensors])
+        _assert_qwen4_exp_source_names_mapped([tensor.name for tensor in reader.tensors], weight_mapping)
     elif parsed_parameters["config"]["model_type"] == "deepseek_v4":
         _postprocess_deepseek_v4_config(parsed_parameters["config"])
 
@@ -1155,7 +1495,7 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, mmap_policy
             for tensor in reader.tensors
             if tensor.name not in _GGUF_RUNTIME_AUX_TENSORS
         }
-        parsed_parameters["weight_mapping"] = get_gguf_converters(model_type)
+        parsed_parameters["weight_mapping"] = get_gguf_converters(model_type, config)
 
     if len(reader_keys) > 0:
         logger.info(f"Some keys of the GGUF file were not considered: {reader_keys}")

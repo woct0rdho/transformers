@@ -27,7 +27,9 @@ from transformers.gguf_conversion_ops import Qwen3_5ReorderValueHeads
 from transformers.modeling_gguf_pytorch_utils import (
     _GGUF_ARCH_CONVERTERS,
     _postprocess_deepseek_v4_config,
+    _postprocess_qwen4_exp_config,
     _postprocess_qwen35_config,
+    _validate_single_file_gguf,
     get_gguf_converters,
 )
 from transformers.quantizers.quantizer_gguf import GGUFQuantizer
@@ -47,6 +49,7 @@ EXPECTED_MODEL_TYPES = sorted(
         "qwen3",
         "qwen3_5_text",
         "qwen3_5_moe_text",
+        "qwen4_exp_text",
         "deepseek_v4",
         "deci",
         "stablelm",
@@ -232,6 +235,95 @@ class GgufArchCoverageTests(unittest.TestCase):
             config["layer_types"],
             ["linear_attention", "full_attention", "linear_attention", "full_attention"],
         )
+
+    def test_qwen4_exp_config_reconstruction(self):
+        config = {
+            "model_type": "qwen4_exp_text",
+            "max_position_embeddings": 1024,
+            "num_hidden_layers": 4,
+            "hidden_size": 32,
+            "head_dim": 8,
+            "_gguf_attention_value_length": 8,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "rms_norm_eps": 1e-6,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 4,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "_gguf_linear_inner_size": 16,
+            "_gguf_rope_dimension_count": 4,
+            "_gguf_rope_dimension_sections": [1, 1, 0, 0],
+            "_gguf_rope_theta": 10000.0,
+            "_gguf_attention_compress_ratios": [0, 0, 0, 4],
+            "hc_count": 4,
+            "hc_lowrank": 8,
+            "indexer_n_heads": 2,
+            "indexer_head_dim": 4,
+            "indexer_budget": 8,
+            "_gguf_ple_layers": [0],
+            "ngram_size": 3,
+            "heads_per_ngram": 2,
+            "ple_conv_kernel_size": 4,
+            "_gguf_ple_eos_token_id": 1,
+            "_gguf_ple_head_dim": 3,
+            "_gguf_ple_layer_multipliers": [17, 19, 23],
+            "_gguf_ple_head_offsets": [0, 5, 11, 18],
+            "_gguf_ple_head_vocab_sizes": [5, 6, 7, 8],
+        }
+        _postprocess_qwen4_exp_config(config, ple_table_size=40)
+        self.assertEqual(
+            config["layer_types"],
+            ["linear_attention", "linear_attention", "linear_attention", "qwen_sparse_attention"],
+        )
+        self.assertEqual(config["ple_layer_ids"], [1])
+        self.assertEqual(config["ple_embed_dim"], 12)
+        self.assertEqual(config["ple_vocab_size"], 40)
+        self.assertEqual(config["ple_head_offsets"], [0, 5, 11, 18])
+        self.assertEqual(config["ple_head_vocab_sizes"], [5, 6, 7, 8])
+        self.assertEqual(config["ple_layer_multipliers"], [17, 19, 23])
+        self.assertFalse(any(key.startswith("_gguf_") for key in config))
+
+    def test_consolidated_gguf_split_metadata_is_validated(self):
+        from unittest.mock import patch
+
+        reader = SimpleNamespace(tensors=[object(), object()])
+
+        def validate(values):
+            with patch(
+                "transformers.modeling_gguf_pytorch_utils.read_field",
+                side_effect=lambda _, field: values.get(field, []),
+            ):
+                _validate_single_file_gguf(reader, "checkpoint.gguf")
+
+        validate({"split.count": [0], "split.no": [0], "split.tensors.count": [2]})
+        validate({"split.count": [1], "split.no": [0]})
+        with self.assertRaisesRegex(ValueError, "split checkpoints are not supported"):
+            validate({"split.count": [2], "split.no": [0], "split.tensors.count": [2]})
+        with self.assertRaisesRegex(ValueError, "without split.tensors.count"):
+            validate({"split.count": [0], "split.no": [0]})
+        with self.assertRaisesRegex(ValueError, "contains 2 tensors"):
+            validate({"split.count": [0], "split.no": [0], "split.tensors.count": [1]})
+        with self.assertRaisesRegex(ValueError, "split.no=1"):
+            validate({"split.count": [1], "split.no": [1], "split.tensors.count": [2]})
+
+    def test_qwen4_exp_converter_names(self):
+        rules = get_gguf_converters("qwen4_exp_text", {"ple_layer_ids": [1]})
+        renamings = [rule for rule in rules if isinstance(rule, WeightRenaming)]
+        converters = [rule for rule in rules if isinstance(rule, WeightConverter)]
+        expected_names = {
+            "blk.0.attn_qkv.weight": "model.layers.0.linear_attn.in_proj_qkv.weight",
+            "blk.0.ssm_conv1d.weight": "model.layers.0.linear_attn.conv1d.weight",
+            "blk.3.indexer.q_proj.weight": "model.layers.3.self_attn.indexer.index_qk_proj.weight",
+            "blk.3.indexer.k_proj.weight": "model.layers.3.self_attn.indexer.index_qk_proj.weight",
+            "blk.0.hc_attn_inject.weight": "model.layers.0.attn_hyper_connection.block_inject_weight.weight",
+            "blk.0.ple_norm_query.weight": "model.layers.0.ple.norm_query.weight",
+            "per_layer_token_embd.weight": "model.layers.0.ple.ple_embedding.ngram_embedding.weight",
+            "output_hc_up.weight": "model.hyper_connection_mixer.input_mix_weight_up.weight",
+        }
+        for source, expected in expected_names.items():
+            actual, _ = rename_source_key(source, renamings, converters)
+            self.assertEqual(actual, expected)
 
     def test_deepseek_v4_config_reconstruction(self):
         config = {
