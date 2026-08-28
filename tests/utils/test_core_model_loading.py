@@ -711,7 +711,7 @@ class TestConvertAndLoadStateDict(unittest.TestCase):
             (),
             {
                 "__init__": lambda self, bs=block_size: setattr(
-                    self, "quantization_config", SimpleNamespace(weight_block_size=bs)
+                    self, "quantization_config", SimpleNamespace(weight_block_size=bs, scale_fmt="float")
                 ),
                 "param_needs_quantization": lambda self, _model, param_name: param_name.endswith("q_proj.weight"),
                 "get_quantize_ops": lambda self: Fp8Quantize(self),
@@ -747,11 +747,11 @@ class TestConvertAndLoadStateDict(unittest.TestCase):
 
         model_state = model.state_dict()
         self.assertFalse(torch.allclose(raw_k, expected_k))
-        torch.testing.assert_close(model_state["model.layers.0.self_attn.k_proj.weight"], expected_k)
-        torch.testing.assert_close(model_state["model.layers.0.self_attn.v_proj.weight"], expected_v)
+        torch.testing.assert_close(model_state["layers.0.self_attn.k_proj.weight"], expected_k)
+        torch.testing.assert_close(model_state["layers.0.self_attn.v_proj.weight"], expected_v)
 
-        q_weight_key = "model.layers.0.self_attn.q_proj.weight"
-        scale_key = "model.layers.0.self_attn.q_proj.weight_scale_inv"
+        q_weight_key = "layers.0.self_attn.q_proj.weight"
+        scale_key = "layers.0.self_attn.q_proj.weight_scale_inv"
         self.assertIn(scale_key, model_state)
         expected_dtype = torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else torch.int8
         self.assertEqual(model_state[q_weight_key].dtype, expected_dtype)
@@ -762,10 +762,9 @@ class TestConvertAndLoadStateDict(unittest.TestCase):
             torch.Size((out_dim // block_size[0], in_dim // block_size[1])),
         )
 
-        dequant = Fp8Dequantize(block_size=block_size)
-        dequantized_q = dequant.convert(
-            [model_state[q_weight_key], model_state[scale_key]],
-            context={"quantization_config": quantizer.quantization_config},
+        dequant = Fp8Dequantize(quantizer)
+        dequantized_q = dequant._dequantize_one(
+            model_state[q_weight_key], model_state[scale_key], output_dtype=torch.float32
         )
         torch.testing.assert_close(dequantized_q, expected_q, rtol=1e-2, atol=1e-2)
 

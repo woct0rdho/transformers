@@ -472,7 +472,7 @@ class PermuteForRope(ConversionOps):
         output: dict[str, list[torch.Tensor]] = {}
         for key, tensors in input_dict.items():
             # Permute q and key weights back (skip biases) to match original RoPE implementation
-            if not any(name in key for name in self.permute_layer_names):
+            if self.permute_layer_names is not None and not any(name in key for name in self.permute_layer_names):
                 output[key] = tensors
                 continue
 
@@ -1222,18 +1222,27 @@ class WeightConverter(WeightTransform):
             pass
 
         if hf_quantizer is not None and self.quantization_operation is not None:
-            with log_conversion_errors(
-                layer_name, loading_info, (len(collected_tensors), layer_name), self.quantization_operation
-            ):
-                collected_tensors = self.quantization_operation.convert(
-                    collected_tensors,
-                    source_patterns=self.source_patterns,
-                    target_patterns=self.target_patterns,
-                    full_layer_name=layer_name,
-                    config=config,
-                    model=model,
-                    missing_keys=loading_info.missing_keys if loading_info else None,
-                )
+            quantized_tensors = {}
+            for target_key, tensor in collected_tensors.items():
+                if not hf_quantizer.param_needs_quantization(model, target_key):
+                    quantized_tensors[target_key] = tensor
+                    continue
+
+                with log_conversion_errors(
+                    target_key, loading_info, (1, target_key), self.quantization_operation
+                ):
+                    quantized_tensors.update(
+                        self.quantization_operation.convert(
+                            {target_key: tensor},
+                            source_patterns=self.source_patterns,
+                            target_patterns=self.target_patterns,
+                            full_layer_name=target_key,
+                            config=config,
+                            model=model,
+                            missing_keys=loading_info.missing_keys if loading_info else None,
+                        )
+                    )
+            collected_tensors = quantized_tensors
         return collected_tensors
 
 
