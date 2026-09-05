@@ -50,6 +50,7 @@ class GgufHfQuantizer(HfQuantizer):
         self.packed_modules = {}
         self.input_permutations = {}
         self.quantized = {}
+        self.names = []
         self.mapping = []
         self.header = None
         self.kernel = None
@@ -143,7 +144,7 @@ class GgufHfQuantizer(HfQuantizer):
         if not self.supported:
             return
         self.mapping = get_gguf_conversion_mapping(self.header.architecture, model.config)
-        self.quantized, packable, self.input_permutations = get_gguf_plan(self.header, self.mapping)
+        self.quantized, packable, self.input_permutations, self.names = get_gguf_plan(self.header, self.mapping)
         if self.quantization_config.dequantize:
             return
         self.packed_modules = replace_with_gguf_modules(model, packable, self.kernel, self.dtype)
