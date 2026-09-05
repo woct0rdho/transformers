@@ -19,15 +19,14 @@ undo llama.cpp's value/layout transforms, matching on the renamed key, at most o
 
 import torch
 
+from ...core_model_loading import Concatenate as CoreConcatenate
 from ...core_model_loading import (
-    Concatenate,
     ConversionOps,
     WeightConverter,
     WeightRenaming,
     WeightTransform,
 )
-from .dequant import GGML_BLOCK
-from .kernels import dequantize_blocks
+from .gguf_quantized_parameter import GgufQuantizedParameter
 
 
 # Shared skeleton for decoder-only models. Norms are absent: whether llama.cpp offsets them by one is
@@ -177,6 +176,25 @@ def _qwen35(config) -> list[WeightTransform]:
     return renamings + offset_norms + per_value_head + value_reorder
 
 
+class Concatenate(CoreConcatenate):
+    """Upstream's `Concatenate`, refusing packed inputs.
+
+    `torch.cat` drops the block type and logical shape a `GgufQuantizedParameter` carries, so a fused
+    target is unpacked, or the quantizer splits it into independent projections, before this runs.
+    """
+
+    @torch.no_grad
+    def convert(
+        self, input_dict: dict[str, torch.Tensor], source_patterns: list[str], target_patterns: list[str], **kwargs
+    ) -> dict[str, torch.Tensor]:
+        for source_pattern in source_patterns:
+            values = input_dict.get(source_pattern, ())
+            values = values if isinstance(values, list) else [values]
+            if any(isinstance(value, GgufQuantizedParameter) for value in values):
+                raise ValueError("Packed GGUF tensors cannot be concatenated")
+        return super().convert(input_dict, source_patterns, target_patterns, **kwargs)
+
+
 def _qwen35moe(config) -> list[WeightTransform]:
     """Everything outside the FFN is `_qwen35`'s: llama.cpp converts both through the same base class."""
     routed = [
@@ -191,7 +209,7 @@ def _qwen35moe(config) -> list[WeightTransform]:
     fuse_gate_up = WeightConverter(
         source_patterns=[r"\.ffn_gate_exps\.weight", r"\.ffn_up_exps\.weight"],
         target_patterns=".mlp.experts.gate_up_proj",
-        operations=[ConcatenateRows(dim=1)],
+        operations=[Concatenate(dim=1)],
     )
     restore_gate = WeightConverter(
         source_patterns="mlp.shared_expert_gate.weight",
@@ -281,13 +299,19 @@ class PermuteRows(ConversionOps):
         self, input_dict: dict[str, torch.Tensor], source_patterns: list[str], target_patterns: list[str], **kwargs
     ) -> dict[str, torch.Tensor]:
         tensor = _single_tensor(input_dict)
-        perm = self.permutation.to(tensor.device)
+        packed = isinstance(tensor, GgufQuantizedParameter)
+        payload = tensor.as_subclass(torch.Tensor) if packed else tensor
+        perm = self.permutation.to(payload.device)
         if self.offset:
-            head, tail = tensor[: self.offset], tensor[self.offset :]
-            tensor = torch.cat([head, tail[perm]], dim=0)
+            head, tail = payload[: self.offset], payload[self.offset :]
+            payload = torch.cat([head, tail[perm]], dim=0)
         else:
-            tensor = tensor[perm]
-        return {target_patterns[0]: tensor.contiguous()}
+            payload = payload[perm]
+        if packed:
+            tensor = GgufQuantizedParameter(payload.contiguous(), tensor.quant_type, tensor.logical_shape)
+        else:
+            tensor = payload.contiguous()
+        return {target_patterns[0]: tensor}
 
 
 class PermuteInputFeatures(ConversionOps):
@@ -315,7 +339,7 @@ class PermuteInputFeatures(ConversionOps):
         self, input_dict: dict[str, torch.Tensor], source_patterns: list[str], target_patterns: list[str], **kwargs
     ) -> dict[str, torch.Tensor]:
         tensor = _single_tensor(input_dict)
-        if tensor.dtype == torch.uint8:
+        if isinstance(tensor, GgufQuantizedParameter) or tensor.dtype == torch.uint8:
             # Packed: the reorder rides on the input instead, so the blocks pass through untouched.
             return {target_patterns[0]: tensor}
         perm = self.permutation.to(tensor.device)
@@ -383,21 +407,12 @@ class Cast(ConversionOps):
         return {name: tensor.to(self.dtype)}
 
 
-class ConcatenateRows(Concatenate):
-    """`Concatenate` on a row axis, which packed blocks survive. A block never spans two rows; joining on the last
-    axis would cut through them.
-
-    Example: `[[1, 2]] + [[3, 4]] -> [[1, 2], [3, 4]]`
-    """
-
-    supports_packed = True
-
-
 class Dequantize(ConversionOps):
-    """Unpack GGUF blocks into values. First in its chain, since later transforms need dense values, and the ggml
-    type is looked up per parameter.
+    """Unpack GGUF blocks into values, on the parameter's own device.
 
-    Example: `[[210, 17, ...]] u8 -> [[0.31, -1.20, ...]] f32`
+    First in its chain, since every later transform is defined on dense values. One instance serves the
+    whole file: llama.cpp mixes quantization types, so `ggml_types` only says which targets are packed,
+    and the block type and logical shape travel on the parameter itself.
     """
 
     def __init__(self, ggml_types: dict[str, int], dtype: "torch.dtype"):
@@ -416,16 +431,12 @@ class Dequantize(ConversionOps):
         ggml_type = self.ggml_types.get(full_layer_name)
         if ggml_type is None:
             return input_dict
-        block_elements, block_bytes = GGML_BLOCK[ggml_type]
         values = {}
         for key, tensors in input_dict.items():
             blocks = tensors[0] if isinstance(tensors, list) else tensors
-            if blocks.dtype != torch.uint8:
-                raise ValueError(f"{key} is {blocks.dtype}, not torch.uint8")
-            cols = blocks.shape[-1] // block_bytes * block_elements
-            flat = blocks.reshape(-1, blocks.shape[-1])
-            unpacked = dequantize_blocks(flat, ggml_type, flat.shape[0], cols, self.dtype)
-            values[key] = unpacked.reshape(*blocks.shape[:-1], cols)
+            if not isinstance(blocks, GgufQuantizedParameter):
+                raise ValueError(f"{key} is not a packed GGUF parameter")
+            values[key] = blocks.dequantize(dtype=self.dtype)
         if len(values) == 1:
             return {full_layer_name: next(iter(values.values()))}
         return values
