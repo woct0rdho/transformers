@@ -20,8 +20,8 @@ undo llama.cpp's value/layout transforms, matching on the renamed key, at most o
 import torch
 
 from ...core_model_loading import ConversionOps, WeightConverter, WeightRenaming, WeightTransform
-from .dequant import GGML_BLOCK
-from .kernels import dequantize_blocks
+from .dequant import dequantize
+from .gguf_quantized_parameter import GgufQuantizedParameter
 
 
 # Shared skeleton for decoder-only models. Norms are absent: whether llama.cpp offsets them by one is
@@ -171,6 +171,23 @@ def _qwen35(config) -> list[WeightTransform]:
     return renamings + offset_norms + per_value_head + value_reorder
 
 
+class Concatenate(ConversionOps):
+    """Concatenate the tensors collected from a one-to-many source conversion."""
+
+    def __init__(self, dim: int):
+        self.dim = dim
+
+    @torch.no_grad
+    def convert(self, input_dict, source_patterns, target_patterns, **kwargs):
+        tensors = []
+        for source_pattern in source_patterns:
+            values = input_dict.get(source_pattern, ())
+            tensors.extend(values if isinstance(values, list) else (values,))
+        if any(isinstance(tensor, GgufQuantizedParameter) for tensor in tensors):
+            raise ValueError("Packed GGUF tensors cannot be concatenated")
+        return {target_patterns[0]: torch.cat(tensors, dim=self.dim)}
+
+
 # gguf `general.architecture` -> builder taking the model config
 GGUF_ARCHS = {
     "qwen35": _qwen35,
@@ -234,13 +251,19 @@ class PermuteRows(ConversionOps):
         self, input_dict: dict[str, torch.Tensor], source_patterns: list[str], target_patterns: list[str], **kwargs
     ) -> dict[str, torch.Tensor]:
         tensor = _single_tensor(input_dict)
-        perm = self.permutation.to(tensor.device)
+        packed = isinstance(tensor, GgufQuantizedParameter)
+        payload = tensor.as_subclass(torch.Tensor) if packed else tensor
+        perm = self.permutation.to(payload.device)
         if self.offset:
-            head, tail = tensor[: self.offset], tensor[self.offset :]
-            tensor = torch.cat([head, tail[perm]], dim=0)
+            head, tail = payload[: self.offset], payload[self.offset :]
+            payload = torch.cat([head, tail[perm]], dim=0)
         else:
-            tensor = tensor[perm]
-        return {target_patterns[0]: tensor.contiguous()}
+            payload = payload[perm]
+        if packed:
+            tensor = GgufQuantizedParameter(payload.contiguous(), tensor.quant_type, tensor.logical_shape)
+        else:
+            tensor = payload.contiguous()
+        return {target_patterns[0]: tensor}
 
 
 class PermuteInputFeatures(ConversionOps):
@@ -270,7 +293,7 @@ class PermuteInputFeatures(ConversionOps):
         self, input_dict: dict[str, torch.Tensor], source_patterns: list[str], target_patterns: list[str], **kwargs
     ) -> dict[str, torch.Tensor]:
         tensor = _single_tensor(input_dict)
-        if tensor.dtype == torch.uint8:
+        if isinstance(tensor, GgufQuantizedParameter) or tensor.dtype == torch.uint8:
             # Packed: the reorder rides on the input instead, so the blocks pass through untouched.
             return {target_patterns[0]: tensor}
         perm = self.permutation.to(tensor.device)
@@ -358,13 +381,28 @@ class Dequantize(ConversionOps):
         full_layer_name: str | None = None,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
+        if len(input_dict) > 1:
+            converted = {}
+            for source_pattern, values in input_dict.items():
+                blocks = _single_tensor({source_pattern: values})
+                ggml_type = getattr(blocks, "quant_type", self.ggml_types.get(full_layer_name))
+                if ggml_type is None:
+                    converted[source_pattern] = blocks
+                elif isinstance(blocks, GgufQuantizedParameter):
+                    converted[source_pattern] = blocks.dequantize(dtype=self.dtype)
+                else:
+                    converted[source_pattern] = dequantize(blocks, ggml_type, dtype=self.dtype)
+            return converted
         ggml_type = self.ggml_types.get(full_layer_name)
         if ggml_type is None:
             return input_dict
         blocks = _single_tensor(input_dict)
-        block_elements, block_bytes = GGML_BLOCK[ggml_type]
-        rows, cols = blocks.shape[0], blocks.shape[1] // block_bytes * block_elements
-        return {full_layer_name: dequantize_blocks(blocks, ggml_type, rows, cols, self.dtype)}
+        values = (
+            blocks.dequantize(dtype=self.dtype)
+            if isinstance(blocks, GgufQuantizedParameter)
+            else dequantize(blocks, ggml_type, dtype=self.dtype)
+        )
+        return {full_layer_name: values}
 
 
 def _single_tensor(input_dict: dict[str, torch.Tensor]) -> torch.Tensor:
