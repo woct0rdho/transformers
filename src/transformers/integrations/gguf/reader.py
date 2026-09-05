@@ -13,7 +13,10 @@
 # limitations under the License.
 """Reading a GGUF file: architecture, tensor types, and tensors keyed by their GGUF names."""
 
+import mmap
+import os
 import struct
+import threading
 import warnings
 from collections.abc import Container
 from math import prod
@@ -224,11 +227,17 @@ class LazyGgufTensor:
         ggml_type: int,
         shape: tuple[int, ...],
         logical_shape: tuple[int, ...] | None = None,
+        releaser=None,
+        offset: int = 0,
     ):
         self.data = data  # a read-only mmap view, untouched until materialized
         self.ggml_type = ggml_type
         self.shape = shape
         self.logical_shape = logical_shape or shape
+        self._releaser = releaser
+        self._offset = offset
+        self._remaining_materializations = None
+        self._release_lock = threading.Lock()
 
     def get_shape(self) -> list[int]:
         """Return the physical shape expected by the generic loading and sharding APIs."""
@@ -254,10 +263,88 @@ class LazyGgufTensor:
         values = raw.view(_TORCH_DTYPE[self.ggml_type]).reshape(self.shape)
         return values[key]
 
+    @property
+    def release_after_materialization(self):
+        return self._release_after_materialization if self._releaser is not None else None
 
-def load_gguf_state_dict(header: GgufHeader) -> dict[str, LazyGgufTensor]:
+    def prepare_materializations(self, count: int):
+        if count <= 0:
+            raise ValueError(f"GGUF tensor materialization count must be positive, got {count}")
+        with self._release_lock:
+            if self._remaining_materializations is not None:
+                raise RuntimeError("GGUF tensor source was prepared more than once")
+            self._remaining_materializations = count
+
+    def is_materialized_view(self, tensor):
+        if tensor.device.type != "cpu" or tensor.numel() == 0:
+            return False
+        try:
+            pointer = tensor.data_ptr()
+        except RuntimeError:
+            return False
+        source = int(self.data.__array_interface__["data"][0])
+        return source <= pointer < source + self.data.nbytes
+
+    def _release_after_materialization(self):
+        with self._release_lock:
+            remaining = 1 if self._remaining_materializations is None else self._remaining_materializations
+            if remaining <= 0:
+                raise RuntimeError("GGUF tensor source was released more than expected")
+            self._remaining_materializations = remaining - 1
+            should_release = remaining == 1
+        if should_release:
+            self._releaser.release(self._offset, self.data.nbytes)
+
+
+def _page_aligned_interior(offset: int, length: int, page_size: int):
+    start = ((offset + page_size - 1) // page_size) * page_size
+    end = ((offset + length) // page_size) * page_size
+    return (start, end - start) if end > start else None
+
+
+class _GgufFileRangeReleaser:
+    def __init__(self, path, mapped_array):
+        mapped_file = getattr(mapped_array, "_mmap", None)
+        if mapped_file is None or not hasattr(mapped_file, "madvise") or not hasattr(mmap, "MADV_DONTNEED"):
+            raise RuntimeError("GGUF mmap page release requires mmap.madvise(MADV_DONTNEED) support")
+        self._mapped_file = mapped_file
+        self._page_size = mmap.PAGESIZE
+        self._lock = threading.Lock()
+        self._fd = (
+            os.open(os.fspath(path), os.O_RDONLY)
+            if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED")
+            else None
+        )
+
+    def release(self, offset: int, length: int):
+        aligned = _page_aligned_interior(offset, length, self._page_size)
+        if aligned is None:
+            return
+        start, size = aligned
+        with self._lock:
+            self._mapped_file.madvise(mmap.MADV_DONTNEED, start, size)
+            if self._fd is not None:
+                os.posix_fadvise(self._fd, start, size, os.POSIX_FADV_DONTNEED)
+
+    def close(self):
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except (AttributeError, OSError):
+            pass
+
+
+def load_gguf_state_dict(header: GgufHeader, mmap_policy: str = "keep") -> dict[str, LazyGgufTensor]:
     """`{gguf_name: LazyGgufTensor}` — the file's tensors, none of them read yet."""
+    if mmap_policy not in {"keep", "release"}:
+        raise ValueError(f"GGUF mmap policy must be 'keep' or 'release', got {mmap_policy!r}")
     blob = _mapped(header.path)
+    releaser = _GgufFileRangeReleaser(header.path, blob) if mmap_policy == "release" else None
+
     state_dict = {}
     for info in header.tensors:
         logical_shape = info.shape
@@ -268,6 +355,8 @@ def load_gguf_state_dict(header: GgufHeader) -> dict[str, LazyGgufTensor]:
                 raise ValueError(f"GGUF tensor {info.name!r} does not have a whole number of quantization blocks")
             shape = (*shape[:-1], shape[-1] // block_elements * block_bytes)
         start = header.data_start + info.offset
-        state_dict[info.name] = LazyGgufTensor(blob[start : start + info.nbytes], info.ggml_type, shape, logical_shape)
+        state_dict[info.name] = LazyGgufTensor(
+            blob[start : start + info.nbytes], info.ggml_type, shape, logical_shape, releaser, start
+        )
 
     return state_dict
