@@ -1449,16 +1449,20 @@ def set_param_for_module(
         # Remove from missing keys (it's either mismatched, or all good)
         loading_info.missing_keys.discard(target_name)
 
-        # For DTensor parameters, compare against the local shard loaded on this rank.
+        # For DTensor parameters, compare against the local shard loaded on this rank. Packed GGUF
+        # parameters expose their dense shape separately while retaining physical uint8 storage.
         expected_shape = ref._local_tensor.shape if is_dtensor(ref) else ref.shape
+        logical_shape = getattr(param_value, "logical_shape", None)
+        checked_shape = torch.Size(logical_shape) if logical_shape is not None else param_value.shape
 
-        # Shape errors result in mismatched key, except for quantized params
+        # Shape errors result in mismatched key, except for quantized params. Packed parameters are
+        # compared through the logical shape they expose instead of their physical storage shape.
         if (
             ref is not None
-            and param_value.shape != expected_shape
+            and checked_shape != expected_shape
             and (hf_quantizer is None or not hf_quantizer.param_needs_quantization(model, target_name))
         ):
-            loading_info.mismatched_keys.add((target_name, param_value.shape, expected_shape))
+            loading_info.mismatched_keys.add((target_name, checked_shape, expected_shape))
         else:
             if is_dtensor(ref):
                 local_param = param_value.detach() if isinstance(param_value, torch.nn.Parameter) else param_value
