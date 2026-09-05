@@ -3196,10 +3196,11 @@ class TestAttentionImplementation(unittest.TestCase):
         )
         # With a wrong _experts_implementation, it should raise a proper exception
         experts_module.config._experts_implementation = "foobar"
-        with self.assertRaisesRegex(KeyError, "`foobar` is not a valid experts implementation registered"):
+        with self.assertRaisesRegex(ValueError, "'foobar' is not supported by ExpertsInterface"):
             _ = experts_module(hidden_states, dummy_indices, dummy_scores)
 
     def test_shared_expert_projection_provider_matches_eager(self):
+        from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
         from transformers.models.qwen2_moe import Qwen2MoeConfig
         from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeExperts
 
@@ -3215,6 +3216,17 @@ class TestAttentionImplementation(unittest.TestCase):
         with torch.no_grad():
             experts.gate_up_proj.copy_(torch.randn_like(experts.gate_up_proj))
             experts.down_proj.copy_(torch.randn_like(experts.down_proj))
+
+        self.assertEqual(
+            experts.supported_experts_implementations,
+            ALL_EXPERTS_FUNCTIONS.supported_implementations(),
+        )
+        self.assertTrue(experts.experts_implementation_switchable)
+        self.assertEqual(set(experts._get_expert_projection_tensors()), {"gate_up", "down"})
+        with patch.dict(ALL_EXPERTS_FUNCTIONS._global_mapping, {}, clear=False):
+            ALL_EXPERTS_FUNCTIONS.register("custom_experts", lambda *args, **kwargs: None)
+            self.assertIn("custom_experts", experts.supported_experts_implementations)
+            experts._validate_supported_experts_implementation("custom_experts")
 
         hidden_states = torch.randn(3, 8)
         top_k_index = torch.tensor([[0, 1], [2, 1], [0, 2]])

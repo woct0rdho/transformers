@@ -590,12 +590,25 @@ def grouped_mm_experts_forward(
 class ExpertsInterface(GeneralInterface):
     """Interface for registering custom experts forward functions."""
 
+    display_name = "ExpertsInterface"
+
     _global_mapping = {
         "deepgemm": deepgemm_bf16_experts_forward,
         "batched_mm": batched_mm_experts_forward,
         "grouped_mm": grouped_mm_experts_forward,
         "sonicmoe": sonicmoe_experts_forward,
     }
+
+    def supported_implementations(self) -> tuple[str, ...]:
+        return ("eager", *self.valid_keys())
+
+    def validate_implementation(self, experts_implementation: str | None) -> str | None:
+        if experts_implementation is not None and experts_implementation not in self.supported_implementations():
+            supported = ", ".join(repr(name) for name in self.supported_implementations())
+            raise ValueError(
+                f"{experts_implementation!r} is not supported by {self.display_name}; choose one of {supported}."
+            )
+        return experts_implementation
 
     def get_interface(self, experts_implementation: str, default: Callable) -> Callable:
         """Return the requested `experts_implementation`. Also strictly check its validity, and raise if invalid."""
@@ -605,10 +618,8 @@ class ExpertsInterface(GeneralInterface):
                 "is expected if you use an Expert Module as a standalone Module. If this is not the case, something went "
                 "wrong with the dispatch of `config._experts_implementation`"
             )
-        elif experts_implementation != "eager" and experts_implementation not in self:
-            raise KeyError(
-                f"`{experts_implementation}` is not a valid experts implementation registered in the `ExpertsInterface`"
-            )
+        else:
+            self.validate_implementation(experts_implementation)
         return super().get(experts_implementation, default)
 
 
@@ -638,10 +649,11 @@ def use_experts_implementation(
     experts_class: type[torch.nn.Module] | None = None,
     *,
     experts_interface: ExpertsInterface = ALL_EXPERTS_FUNCTIONS,
-    is_concatenated: bool = True,
+    is_concatenated: bool | None = True,
     is_transposed: bool = False,
     has_bias: bool = False,
     has_gate: bool = True,
+    projection_layout: str | None = None,
 ) -> type[torch.nn.Module]:
     """Decorator to modify experts class to support different experts implementations.
 
@@ -668,6 +680,16 @@ def use_experts_implementation(
     def wrapper(experts_class: type[torch.nn.Module]) -> type[torch.nn.Module]:
         original_init = experts_class.__init__
         original_forward = experts_class.forward
+        source_apply_gate = getattr(experts_class, "_apply_gate", None)
+        gate_implementation = "default" if source_apply_gate in (None, _default_apply_gate) else "custom"
+        resolved_projection_layout = projection_layout
+        if resolved_projection_layout is None:
+            if not has_gate:
+                resolved_projection_layout = "up_only"
+            elif is_concatenated:
+                resolved_projection_layout = "concatenated_gate_up"
+            else:
+                resolved_projection_layout = "interleaved_gate_up"
 
         @wraps(original_init)
         def __init__(self, config, *args, **kwargs):
@@ -677,6 +699,8 @@ def use_experts_implementation(
             self.has_bias = has_bias
             self.is_transposed = is_transposed
             self.is_concatenated = is_concatenated
+            self.projection_layout = resolved_projection_layout
+            self.gate_implementation = gate_implementation
 
         @wraps(original_forward)
         def forward(self, *args, **kwargs):
@@ -698,6 +722,22 @@ def use_experts_implementation(
             if not hasattr(experts_class, method_name):
                 setattr(experts_class, method_name, method)
 
+        if "_validate_supported_experts_implementation" not in experts_class.__dict__:
+
+            @classmethod
+            def _validate_supported_experts_implementation(cls, experts_implementation):
+                return experts_interface.validate_implementation(experts_implementation)
+
+            setattr(
+                experts_class, "_validate_supported_experts_implementation", _validate_supported_experts_implementation
+            )
+
+        setattr(
+            experts_class,
+            "supported_experts_implementations",
+            property(lambda self: experts_interface.supported_implementations()),
+        )
+        setattr(experts_class, "experts_implementation_switchable", True)
         experts_class.__init__ = __init__
         experts_class.forward = forward
         return experts_class
