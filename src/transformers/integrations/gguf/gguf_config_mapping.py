@@ -28,6 +28,22 @@ def _required(metadata, *keys):
     raise ValueError(f"GGUF metadata is missing required field {keys[0]!r}")
 
 
+def _qwen35_moe_config(metadata, tensor_names):
+    prefix = "qwen35moe" if "qwen35moe.expert_count" in metadata else "qwen35"
+    config = _qwen35_config(metadata, tensor_names, architecture=prefix)
+    config["model_type"] = "qwen3_5_moe_text"
+    config["architectures"] = ["Qwen3_5MoeForCausalLM"]
+    config["num_experts"] = _required(metadata, f"{prefix}.expert_count")
+    config["num_experts_per_tok"] = _required(metadata, f"{prefix}.expert_used_count")
+    config["moe_intermediate_size"] = _required(
+        metadata, f"{prefix}.expert_feed_forward_length", f"{prefix}.moe_intermediate_size"
+    )
+    config["shared_expert_intermediate_size"] = _required(
+        metadata, f"{prefix}.expert_shared_feed_forward_length", f"{prefix}.shared_expert_intermediate_size"
+    )
+    return config
+
+
 def _qwen35_config(metadata, tensor_names, architecture="qwen35", require_interval=True):
     """Qwen3.5: hybrid GatedDeltaNet + full attention, with an mrope and an MTP block."""
     key = lambda name: metadata[f"{architecture}.{name}"]  # noqa: E731
@@ -126,6 +142,7 @@ def _qwen35_config(metadata, tensor_names, architecture="qwen35", require_interv
 
 GGUF_CONFIG_ARCHS = {
     "qwen35": _qwen35_config,
+    "qwen35moe": _qwen35_moe_config,
 }
 
 
