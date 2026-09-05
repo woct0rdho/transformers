@@ -946,9 +946,11 @@ class ModuleUtilsMixin:
             if exclude_embeddings and name in embedding_param_names:
                 continue
             if param.requires_grad or not only_trainable:
+                if (logical_numel := getattr(param, "logical_numel", None)) is not None:
+                    total_params += logical_numel
                 # For 4bit models, we need to multiply the number of parameters by 2 as half of the parameters are
                 # used for the 4bit quantization (uint8 tensors are stored)
-                if is_loaded_in_4bit and isinstance(param, bnb.nn.Params4bit):
+                elif is_loaded_in_4bit and isinstance(param, bnb.nn.Params4bit):
                     if hasattr(param, "element_size"):
                         num_bytes = param.element_size()
                     elif hasattr(param, "quant_storage"):
