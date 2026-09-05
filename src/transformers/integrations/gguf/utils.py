@@ -61,19 +61,20 @@ def get_gguf_plan(
         param_name = gguf_name
         for renaming in renamings:
             param_name, _ = renaming.rename_source_key(param_name)
-        names.append(param_name)
+        converter = next((entry for entry in converters if entry.rename_source_key(param_name)[1]), None)
+        target_name = converter.rename_source_key(param_name)[0] if converter is not None else param_name
+        names.append(target_name)
         if ggml_type not in GGML_BLOCK:
             continue
-        quantized[param_name] = ggml_type
-        converter = next((entry for entry in converters if entry.rename_source_key(param_name)[1]), None)
+        quantized[target_name] = ggml_type
         operations = getattr(converter, "operations", ())
         # every conversion applied to this tensor must be safe on packed bytes
         if converter is None or all(getattr(op, "supports_packed", False) for op in operations):
-            packable[param_name] = ggml_type
+            packable[target_name] = ggml_type
             # an op that cannot reorder packed columns asks for its input to be reordered instead
             for operation in operations:
                 if (permutation := getattr(operation, "input_permutation", None)) is not None:
-                    permutations[param_name] = permutation
+                    permutations[target_name] = permutation
     return quantized, packable, permutations, names
 
 
