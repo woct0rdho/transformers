@@ -43,7 +43,7 @@ def get_gguf_conversion_mapping(gguf_arch: str, config) -> list[WeightTransform]
 
 def get_gguf_plan(
     header: GgufHeader, mapping: list[WeightTransform]
-) -> tuple[dict[str, int], dict[str, int], dict[str, torch.Tensor]]:
+) -> tuple[dict[str, int], dict[str, int], dict[str, torch.Tensor], list[str]]:
     """Work out, for every tensor the file stores as blocks, whether it can stay that way.
 
     It can if none of the conversions on its way to the model touch the bytes. `mapping` is the whole
@@ -58,6 +58,7 @@ def get_gguf_plan(
         `permutations`: model name -> index tensor, for a packed weight whose *input* is gathered
             instead, since permuting its columns would mean requantizing.
             `{"model.layers.0.linear_attn.out_proj.weight": tensor([0, 1, 2, ...])}`
+        `names`: every tensor's name after conversion, in the order the file stores them.
     """
     # On a copy: asking a transform whether it matches a name marks it as used and arms the stateful
     # renamings, and the mapping handed back to the loader has to be untouched by that.
@@ -67,11 +68,12 @@ def get_gguf_plan(
 
     pattern_to_converter = {pattern: converter for converter in converters for pattern in converter.source_patterns}
 
-    quantized, packable, permutations = {}, {}, {}
+    quantized, packable, permutations, names = {}, {}, {}, []
     for gguf_name, ggml_type in header.ggml_types.items():
+        param_name, source_pattern = rename_source_key(gguf_name, renamings, converters)
+        names.append(param_name)
         if ggml_type not in GGML_BLOCK:
             continue
-        param_name, source_pattern = rename_source_key(gguf_name, renamings, converters)
         quantized[param_name] = ggml_type
         converter = pattern_to_converter.get(source_pattern)
         operations = getattr(converter, "operations", ())
@@ -82,7 +84,7 @@ def get_gguf_plan(
             for operation in operations:
                 if (permutation := getattr(operation, "input_permutation", None)) is not None:
                     permutations[param_name] = permutation
-    return quantized, packable, permutations
+    return quantized, packable, permutations, names
 
 
 def get_unconverted_keys(mapping: list[WeightTransform], header: GgufHeader) -> list[str]:
