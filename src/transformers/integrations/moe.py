@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from functools import wraps
+from typing import NamedTuple
 
 from ..utils import logging
 from ..utils.generic import GeneralInterface
@@ -109,39 +110,175 @@ def _batched_linear(
     return out
 
 
-def batched_mm_experts_forward(
-    self: torch.nn.Module,
+class _ExpertRoutingPlan(NamedTuple):
+    selected_hidden_states: torch.Tensor
+    expert_ids: torch.Tensor
+    sample_weights: torch.Tensor
+    inv_perm: torch.Tensor | None
+    num_tokens: int
+    num_top_k: int
+    hidden_dim: int
+
+
+class _ExpertExecutionPlan(NamedTuple):
+    expert_ids: torch.Tensor
+    route_indices: torch.Tensor | None
+    offsets: torch.Tensor | None
+    input_mask: torch.Tensor | None
+    output_mask: torch.Tensor | None
+
+
+def _prepare_expert_routing(
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
-) -> torch.Tensor:
+    implementation: str,
+) -> _ExpertRoutingPlan:
     num_top_k = top_k_index.size(-1)
     num_tokens = hidden_states.size(0)
     hidden_dim = hidden_states.size(-1)
-
-    # S is the number of selected tokens-experts pairs (S = num_tokens * num_top_k)
-    # Replicate each token num_top_k times to align with the flattened (S,) routing tensors.
-    selected_hidden_states = hidden_states.repeat_interleave(num_top_k, dim=0)
     sample_weights = top_k_weights.reshape(-1)  # (S,)
     expert_ids = top_k_index.reshape(-1)  # (S,)
+    inv_perm = None
 
-    # Clamp EP sentinels so `gate_up_proj[expert_ids]` stays in-bounds. Routing weights are already
-    # zero at sentinel slots (RouterParallel masks them at dispatch), so the weighted mul drops
-    # those contributions — we pay the wasted GEMM compute because batched_mm has no offset to skip.
-    # Out-of-place to avoid mutating the caller's routing tensor (a contiguous `reshape(-1)` aliases it).
-    expert_ids = expert_ids.clamp(0, self.num_experts - 1)
+    # S is the number of selected tokens-experts pairs (S = num_tokens * num_top_k)
+    if implementation == "batched_mm":
+        # Replicate each token num_top_k times to align with the flattened (S,) routing tensors.
+        selected_hidden_states = hidden_states.repeat_interleave(num_top_k, dim=0)
+    elif implementation == "grouped_mm":
+        device = hidden_states.device
+        # Sort by expert for grouped processing
+        expert_ids_g, perm = torch.sort(expert_ids)
+        selected_hidden_states_g = hidden_states[perm // num_top_k]
+        sample_weights_g = sample_weights[perm]
+        inv_perm = torch.empty_like(perm)
+        inv_perm[perm] = torch.arange(perm.size(0), device=device)
+        selected_hidden_states, expert_ids, sample_weights = selected_hidden_states_g, expert_ids_g, sample_weights_g
+    else:
+        raise ValueError(f"Unknown experts implementation {implementation!r}")
 
+    return _ExpertRoutingPlan(
+        selected_hidden_states,
+        expert_ids,
+        sample_weights,
+        inv_perm,
+        num_tokens,
+        num_top_k,
+        hidden_dim,
+    )
+
+
+def _default_prepare_expert_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    return hidden_states
+
+
+def _default_prepare_expert_execution(
+    self,
+    routing_plan: _ExpertRoutingPlan,
+    implementation: str,
+) -> _ExpertExecutionPlan:
+    if implementation == "batched_mm":
+        # Clamp EP sentinels so `gate_up_proj[expert_ids]` stays in-bounds. Routing weights are already
+        # zero at sentinel slots (RouterParallel masks them at dispatch), so the weighted mul drops
+        # those contributions — we pay the wasted GEMM compute because batched_mm has no offset to skip.
+        # Out-of-place to avoid mutating the caller's routing tensor (a contiguous `reshape(-1)` aliases it).
+        expert_ids = routing_plan.expert_ids.clamp(0, self.num_experts - 1)
+        return _ExpertExecutionPlan(expert_ids, None, None, None, None)
+
+    if implementation == "grouped_mm":
+        device = routing_plan.selected_hidden_states.device
+        expert_ids_g = routing_plan.expert_ids
+        # Compute offsets for grouped_mm
+        # using histc instead of bincount to avoid cuda graph issues
+        # With deterministic algorithms, CPU only supports float input, CUDA only supports int input.
+        # torch.histc() does not support integer dtypes on CPU and MPS.
+        histc_input = expert_ids_g.float() if device.type in ("cpu", "mps") else expert_ids_g.int()
+        tokens_per_expert = torch.histc(histc_input, bins=self.num_experts, min=0, max=self.num_experts - 1)
+        offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
+
+        # EP sentinel handling: leave `expert_ids` unclamped so the sort pushes sentinels to the tail,
+        # `histc(max=num_experts-1)` drops them from `tokens_per_expert`, and grouped_mm skips rows
+        # beyond `offsets[-1]` — sentinels cost no real GEMM compute. The kernel leaves sentinel-tail
+        # rows of its output uninit (both fwd output and bwd `d_input`), but ONE pre-mask + ONE
+        # post-mask covers the whole forward — no per-grouped_mm masking is needed, because
+        # intermediate sentinel-row NaN is only ever consumed by the next grouped_mm, which itself
+        # only reads rows `< offsets[-1]`:
+        #   - fwd post-mask on `weighted_out`: kills `proj_out[sentinel] * 0 = NaN * 0 = NaN`
+        #     before the per-token reduction sums it.
+        #   - bwd pre-mask on `selected_hidden_states_g`: its `masked_fill_` backward zeros sentinel
+        #     rows of `d_selected_hidden_states_g` after the up grouped_mm bwd writes them as
+        #     uninit, and before the gather's scatter-add pushes them into `d_hidden_states`.
+        # In-place clamp on `expert_ids_g` keeps the per-row bias gather in-bounds (bias added at
+        # sentinel positions falls in rows the kernel skips, so harmless). Safe to mutate now —
+        # nothing downstream needs the sentinel info from `expert_ids_g` itself.
+        sentinel_mask = (expert_ids_g >= self.num_experts).unsqueeze(-1)
+        expert_ids_g.clamp_(max=self.num_experts - 1)
+        return _ExpertExecutionPlan(expert_ids_g, None, offsets, sentinel_mask, sentinel_mask)
+
+    raise ValueError(f"Unknown experts implementation {implementation!r}")
+
+
+def _default_get_expert_projection_tensors(self) -> dict[str, torch.Tensor]:
+    projections = {"down": self.down_proj}
+    projections["gate_up" if self.has_gate else "up"] = self.gate_up_proj if self.has_gate else self.up_proj
+    return projections
+
+
+def _dense_expert_linear(
+    self,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    execution_plan: _ExpertExecutionPlan,
+    implementation: str,
+) -> torch.Tensor:
+    if implementation == "batched_mm":
+        selected_weights = weight[execution_plan.expert_ids]
+        selected_biases = bias[execution_plan.expert_ids] if bias is not None else None
+        return _batched_linear(
+            input,
+            selected_weights,
+            bias=selected_biases,
+            is_transposed=self.is_transposed,
+        )
+
+    if implementation == "grouped_mm":
+        # Select expert weights and biases
+        # NOTE: We keep all experts here and rely on offsets to target the active ones.
+        # I have already implemented a version that only passes the active experts, but
+        # to do so I had to use torch.unique which breaks the graph capture (data-dependent).
+        # Also there were no speedup gains from it in my experiments, even in eager mode.
+        # NOTE: The grouped_mm kernel only targets the active experts / tokens via the offsets
+        selected_weights = weight
+        selected_biases = bias[execution_plan.expert_ids] if bias is not None else None
+        return _grouped_linear(
+            input,
+            selected_weights,
+            execution_plan.offsets,
+            bias=selected_biases,
+            is_transposed=self.is_transposed,
+        )
+
+    raise ValueError(f"Unknown experts implementation {implementation!r}")
+
+
+def _default_project_expert_up(
+    self,
+    selected_hidden_states: torch.Tensor,
+    execution_plan: _ExpertExecutionPlan,
+    implementation: str,
+) -> torch.Tensor:
     # Select gate_up or just up projection weights and biases
     if self.has_gate:
-        selected_weights = self.gate_up_proj[expert_ids]
-        selected_biases = self.gate_up_proj_bias[expert_ids] if self.has_bias else None
+        weight = self.gate_up_proj
+        bias = self.gate_up_proj_bias if self.has_bias else None
     else:
-        selected_weights = self.up_proj[expert_ids]
-        selected_biases = self.up_proj_bias[expert_ids] if self.has_bias else None
+        weight = self.up_proj
+        bias = self.up_proj_bias if self.has_bias else None
 
-    # --- Up projection per expert (batched) ---
-    proj_out = _batched_linear(
-        selected_hidden_states, selected_weights, bias=selected_biases, is_transposed=self.is_transposed
+    # --- Up projection per expert ---
+    proj_out = _dense_expert_linear(
+        self, selected_hidden_states, weight, bias, execution_plan, implementation
     )  # (S, 2 * intermediate_dim) or  (S, intermediate_dim) depending on whether we have gating
 
     # Apply gating or activation
@@ -151,26 +288,93 @@ def batched_mm_experts_forward(
     else:
         # for non-gated experts we just apply the activation function
         proj_out = self.act_fn(proj_out)  # (S, intermediate_dim)
+    return proj_out
 
-    # Select down projection weights and biases for selected samples
-    selected_weights = self.down_proj[expert_ids]
-    selected_biases = self.down_proj_bias[expert_ids] if self.has_bias else None
 
-    # --- Down projection per expert (batched) ---
-    proj_out = _batched_linear(
-        proj_out, selected_weights, bias=selected_biases, is_transposed=self.is_transposed
+def _default_project_expert_down(
+    self,
+    proj_out: torch.Tensor,
+    execution_plan: _ExpertExecutionPlan,
+    implementation: str,
+) -> torch.Tensor:
+    # Select down projection weights and biases
+    bias = self.down_proj_bias if self.has_bias else None
+    # --- Down projection per expert ---
+    proj_out = _dense_expert_linear(
+        self, proj_out, self.down_proj, bias, execution_plan, implementation
     )  # (S, hidden_dim)
+    return proj_out
 
+
+def _default_cast_expert_routing_weights(
+    self,
+    sample_weights: torch.Tensor,
+    proj_out: torch.Tensor,
+) -> torch.Tensor:
+    return sample_weights
+
+
+def _finalize_expert_routing(
+    self,
+    proj_out: torch.Tensor,
+    hidden_states: torch.Tensor,
+    routing_plan: _ExpertRoutingPlan,
+    execution_plan: _ExpertExecutionPlan,
+) -> torch.Tensor:
     # Apply routing weights
+    sample_weights = self._cast_expert_routing_weights(routing_plan.sample_weights, proj_out)
     weighted_out = proj_out * sample_weights.unsqueeze(-1)  # (S, hidden_dim)
-
+    if execution_plan.output_mask is not None:
+        # Post-mask (fwd path).
+        weighted_out.masked_fill_(execution_plan.output_mask, 0.0)
+    inv_perm = routing_plan.inv_perm
+    if inv_perm is not None:
+        # Restore original order
+        weighted_out = weighted_out[inv_perm]  # (S, hidden_dim)
     # Accumulate results using deterministic reshape+sum instead of index_add_
     # index_add_ with duplicate indices is non-deterministic on CUDA due to atomicAdd
     # index_add_ accumulates in-place using the dtype of the output tensor (fp16/bf16)
     # reshape+sum accumulates in fp32 which is more stable for low precision training/inference.
-    final_hidden_states = weighted_out.view(num_tokens, num_top_k, hidden_dim).sum(dim=1)
-
+    final_hidden_states = weighted_out.view(
+        routing_plan.num_tokens, routing_plan.num_top_k, routing_plan.hidden_dim
+    ).sum(dim=1)
     return final_hidden_states.to(hidden_states.dtype)
+
+
+def _experts_forward(
+    self: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    implementation: str,
+) -> torch.Tensor:
+    compute_hidden_states = self._prepare_expert_hidden_states(hidden_states)
+    routing_plan = _prepare_expert_routing(
+        compute_hidden_states,
+        top_k_index,
+        top_k_weights,
+        implementation,
+    )
+    execution_plan = self._prepare_expert_execution(routing_plan, implementation)
+    selected_hidden_states = routing_plan.selected_hidden_states
+    if execution_plan.input_mask is not None:
+        selected_hidden_states_g = selected_hidden_states
+        # Pre-mask (bwd path).
+        selected_hidden_states_g.masked_fill_(execution_plan.input_mask, 0.0)
+        selected_hidden_states = selected_hidden_states_g
+
+    proj_out = self._project_expert_up(selected_hidden_states, execution_plan, implementation)
+    proj_out = self._project_expert_down(proj_out, execution_plan, implementation)
+    return _finalize_expert_routing(self, proj_out, hidden_states, routing_plan, execution_plan)
+
+
+def batched_mm_experts_forward(
+    self: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    return _experts_forward(self, hidden_states, top_k_index, top_k_weights, "batched_mm")
 
 
 # torch.compiler.disable does not work with fullgraph=True, so we implement a custom operator to opaque this function.
@@ -380,102 +584,7 @@ def grouped_mm_experts_forward(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
-    device = hidden_states.device
-    num_top_k = top_k_index.size(-1)
-    num_tokens = hidden_states.size(0)
-    hidden_dim = hidden_states.size(-1)
-
-    # S is the number of selected tokens-experts pairs (S = num_tokens * num_top_k)
-    sample_weights = top_k_weights.reshape(-1)  # (S,)
-    expert_ids = top_k_index.reshape(-1)  # (S,)
-
-    # Sort by expert for grouped processing
-    expert_ids_g, perm = torch.sort(expert_ids)
-    selected_hidden_states_g = hidden_states[perm // num_top_k]
-    sample_weights_g = sample_weights[perm]
-
-    # Compute offsets for grouped_mm
-    # using histc instead of bincount to avoid cuda graph issues
-    # With deterministic algorithms, CPU only supports float input, CUDA only supports int input.
-    # torch.histc() does not support integer dtypes on CPU and MPS.
-    histc_input = expert_ids_g.float() if device.type in ("cpu", "mps") else expert_ids_g.int()
-    tokens_per_expert = torch.histc(histc_input, bins=self.num_experts, min=0, max=self.num_experts - 1)
-    offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
-
-    # EP sentinel handling: leave `expert_ids` unclamped so the sort pushes sentinels to the tail,
-    # `histc(max=num_experts-1)` drops them from `tokens_per_expert`, and grouped_mm skips rows
-    # beyond `offsets[-1]` — sentinels cost no real GEMM compute. The kernel leaves sentinel-tail
-    # rows of its output uninit (both fwd output and bwd `d_input`), but ONE pre-mask + ONE
-    # post-mask covers the whole forward — no per-grouped_mm masking is needed, because
-    # intermediate sentinel-row NaN is only ever consumed by the next grouped_mm, which itself
-    # only reads rows `< offsets[-1]`:
-    #   - fwd post-mask on `weighted_out`: kills `proj_out[sentinel] * 0 = NaN * 0 = NaN`
-    #     before the per-token reduction sums it.
-    #   - bwd pre-mask on `selected_hidden_states_g`: its `masked_fill_` backward zeros sentinel
-    #     rows of `d_selected_hidden_states_g` after the up grouped_mm bwd writes them as
-    #     uninit, and before the gather's scatter-add pushes them into `d_hidden_states`.
-    # In-place clamp on `expert_ids_g` keeps the per-row bias gather in-bounds (bias added at
-    # sentinel positions falls in rows the kernel skips, so harmless). Safe to mutate now —
-    # nothing downstream needs the sentinel info from `expert_ids_g` itself.
-    sentinel_mask = (expert_ids_g >= self.num_experts).unsqueeze(-1)
-    expert_ids_g.clamp_(max=self.num_experts - 1)
-
-    # Select expert weights and biases
-    # NOTE: We keep all experts here and rely on offsets to target the active ones.
-    # I have already implemented a version that only passes the active experts, but
-    # to do so I had to use torch.unique which breaks the graph capture (data-dependent).
-    # Also there were no speedup gains from it in my experiments, even in eager mode.
-    # NOTE: The grouped_mm kernel only targets the active experts / tokens via the offsets
-    if self.has_gate:
-        selected_weights = self.gate_up_proj
-        selected_biases = self.gate_up_proj_bias[expert_ids_g] if self.has_bias else None
-    else:
-        selected_weights = self.up_proj
-        selected_biases = self.up_proj_bias[expert_ids_g] if self.has_bias else None
-
-    # Pre-mask (bwd path).
-    selected_hidden_states_g.masked_fill_(sentinel_mask, 0.0)
-
-    # --- Up projection per expert (grouped) ---
-    proj_out = _grouped_linear(
-        selected_hidden_states_g, selected_weights, offsets, bias=selected_biases, is_transposed=self.is_transposed
-    )  # (S, 2 * intermediate_dim) or  (S, intermediate_dim) depending on whether we have gating
-
-    # Apply gating or activation
-    if self.has_gate:
-        # for gated experts we apply the custom/default gating mechanism
-        proj_out = self._apply_gate(proj_out)  # (S, intermediate_dim)
-    else:
-        # for non-gated experts we just apply the activation function
-        proj_out = self.act_fn(proj_out)  # (S, intermediate_dim)
-
-    # Select down projection weights and biases
-    selected_weights = self.down_proj
-    selected_biases = self.down_proj_bias[expert_ids_g] if self.has_bias else None
-
-    # --- Down projection per expert (grouped) ---
-    proj_out = _grouped_linear(
-        proj_out, selected_weights, offsets, bias=selected_biases, is_transposed=self.is_transposed
-    )  # (S, hidden_dim)
-
-    # Apply routing weights
-    weighted_out = proj_out * sample_weights_g.unsqueeze(-1)  # (S, hidden_dim)
-
-    # Post-mask (fwd path).
-    weighted_out.masked_fill_(sentinel_mask, 0.0)
-
-    # Restore original order
-    inv_perm = torch.empty_like(perm)
-    inv_perm[perm] = torch.arange(perm.size(0), device=device)
-    weighted_out = weighted_out[inv_perm]  # (S, hidden_dim)
-
-    # Accumulate results using deterministic reshape+sum instead of index_add_
-    # index_add_ with duplicate indices is non-deterministic on CUDA due to atomicAdd
-    # index_add_ accumulates in-place using the dtype of the output tensor (fp16/bf16)
-    # reshape+sum accumulates in fp32 which is more stable for low precision training/inference.
-    final_hidden_states = weighted_out.view(num_tokens, num_top_k, hidden_dim).sum(dim=1)
-
-    return final_hidden_states.to(hidden_states.dtype)
+    return _experts_forward(self, hidden_states, top_k_index, top_k_weights, "grouped_mm")
 
 
 class ExpertsInterface(GeneralInterface):
@@ -518,6 +627,11 @@ def _default_apply_gate(self, gate_up_out: torch.Tensor) -> torch.Tensor:
     """
     gate, up = gate_up_out.chunk(2, dim=-1)  # (S, intermediate_dim)
     return self.act_fn(gate) * up  # (S, intermediate_dim)
+
+
+def _default_apply_split_gate(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """Apply the default gated-MLP operation to separate gate and up projections."""
+    return self.act_fn(gate) * up
 
 
 def use_experts_implementation(
@@ -571,6 +685,18 @@ def use_experts_implementation(
 
         if not hasattr(experts_class, "_apply_gate"):
             experts_class._apply_gate = _default_apply_gate
+        if not hasattr(experts_class, "_apply_split_gate"):
+            experts_class._apply_split_gate = _default_apply_split_gate
+        for method_name, method in (
+            ("_prepare_expert_hidden_states", _default_prepare_expert_hidden_states),
+            ("_prepare_expert_execution", _default_prepare_expert_execution),
+            ("_get_expert_projection_tensors", _default_get_expert_projection_tensors),
+            ("_project_expert_up", _default_project_expert_up),
+            ("_project_expert_down", _default_project_expert_down),
+            ("_cast_expert_routing_weights", _default_cast_expert_routing_weights),
+        ):
+            if not hasattr(experts_class, method_name):
+                setattr(experts_class, method_name, method)
 
         experts_class.__init__ = __init__
         experts_class.forward = forward
