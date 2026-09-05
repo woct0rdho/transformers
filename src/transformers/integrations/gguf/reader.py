@@ -14,6 +14,7 @@
 """Reading a GGUF file: architecture, tensor types, and tensors keyed by their GGUF names."""
 
 import struct
+import warnings
 from collections.abc import Container
 from math import prod
 from typing import NamedTuple
@@ -22,11 +23,24 @@ import numpy as np
 import torch
 
 from .dequant import GGML_BLOCK, GGML_NAME
+from .gguf_quantized_parameter import GgufQuantizedParameter
 
 
-# the ggml type ids a GGUF holds values rather than blocks under, and what they are
-_GGML_F32, _GGML_F16, _GGML_BF16 = 0, 1, 30
-_TORCH_DTYPE = {_GGML_F32: torch.float32, _GGML_F16: torch.float16, _GGML_BF16: torch.bfloat16}
+# The ggml type IDs for tensors stored as individual scalar values rather than quantized blocks,
+# together with their corresponding torch dtypes.
+# Integer tensors are semantic model state (for example DeepSeek V4's tid2eid routing table), not weights.
+_GGML_F32, _GGML_F16 = 0, 1
+_GGML_I8, _GGML_I16, _GGML_I32, _GGML_I64, _GGML_F64, _GGML_BF16 = 24, 25, 26, 27, 28, 30
+_TORCH_DTYPE = {
+    _GGML_F32: torch.float32,
+    _GGML_F16: torch.float16,
+    _GGML_I8: torch.int8,
+    _GGML_I16: torch.int16,
+    _GGML_I32: torch.int32,
+    _GGML_I64: torch.int64,
+    _GGML_F64: torch.float64,
+    _GGML_BF16: torch.bfloat16,
+}
 
 _GGUF_VERSIONS = (2, 3)  # v1 counted tensors in 32 bits; no file in the wild still uses it
 
@@ -86,6 +100,10 @@ class GgufHeader(NamedTuple):
         alignment = metadata.get("general.alignment", 32)  # llama.cpp's default
 
         entries, pos = _read_tensor_table(blob, tensor_count, pos)
+        names = [name for name, *_ in entries]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"GGUF tensor table contains duplicate names: {duplicates[:8]}")
         infos = tuple(
             TensorInfo(name, shape, ggml_type, offset, _byte_count(ggml_type, prod(shape), gguf_path))
             for name, shape, ggml_type, offset in entries
@@ -190,39 +208,66 @@ def _byte_count(ggml_type: int, elements: int, gguf_path: str) -> int:
             f"Supported quantized types: {supported}."
         )
     block_elements, block_bytes = GGML_BLOCK[ggml_type]
+    if elements % block_elements:
+        raise ValueError(
+            f"{gguf_path} stores {elements} elements of ggml type {ggml_type}, which is not a whole number of blocks."
+        )
     return elements // block_elements * block_bytes
 
 
 class LazyGgufTensor:
     """One tensor of the file, read only when the loading pipeline asks for it."""
 
-    def __init__(self, data: np.ndarray, ggml_type: int, shape: tuple[int, ...]):
+    def __init__(
+        self,
+        data: np.ndarray,
+        ggml_type: int,
+        shape: tuple[int, ...],
+        logical_shape: tuple[int, ...] | None = None,
+    ):
         self.data = data  # a read-only mmap view, untouched until materialized
         self.ggml_type = ggml_type
         self.shape = shape
+        self.logical_shape = logical_shape or shape
 
-    def __getitem__(self, _) -> torch.Tensor:
-        raw = torch.from_numpy(np.copy(self.data))
+    def get_shape(self) -> list[int]:
+        """Return the physical shape expected by the generic loading and sharding APIs."""
+        return list(self.shape)
+
+    def get_dtype(self) -> str:
+        if self.ggml_type in _TORCH_DTYPE:
+            return str(_TORCH_DTYPE[self.ggml_type]).removeprefix("torch.").upper()
+        return "UINT8"
+
+    def __getitem__(self, key) -> torch.Tensor:
+        if self.ggml_type not in _TORCH_DTYPE and key is not Ellipsis:
+            raise ValueError("Slicing a packed GGUF tensor is unsupported unless the complete tensor is selected")
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
+            raw = torch.from_numpy(np.ascontiguousarray(self.data))
         if self.ggml_type not in _TORCH_DTYPE:
-            return raw.reshape(self.shape)
+            return GgufQuantizedParameter(raw.reshape(self.shape), self.ggml_type, self.logical_shape)
         # The file is mapped as bytes, since numpy has no bfloat16, so the values are reinterpreted here.
         # Left in the type the file wrote: the transforms need it -- a norm is stored as `w + 1`, and
         # rounding before the subtraction spends the precision available near 1.0 on a much smaller
         # weight. `Cast` is the last op of every chain, so this lands in the model's dtype anyway.
-        return raw.view(_TORCH_DTYPE[self.ggml_type]).reshape(self.shape)
+        values = raw.view(_TORCH_DTYPE[self.ggml_type]).reshape(self.shape)
+        return values[key]
 
 
 def load_gguf_state_dict(header: GgufHeader) -> dict[str, LazyGgufTensor]:
     """`{gguf_name: LazyGgufTensor}` — the file's tensors, none of them read yet."""
     blob = _mapped(header.path)
-
     state_dict = {}
     for info in header.tensors:
-        shape = info.shape
+        logical_shape = info.shape
+        shape = logical_shape
         if info.ggml_type not in _TORCH_DTYPE:  # blocks, not values: as many bytes per row as it takes
             block_elements, block_bytes = GGML_BLOCK[info.ggml_type]
-            shape = (shape[0], shape[1] // block_elements * block_bytes)
+            if not shape or shape[-1] % block_elements:
+                raise ValueError(f"GGUF tensor {info.name!r} does not have a whole number of quantization blocks")
+            shape = (*shape[:-1], shape[-1] // block_elements * block_bytes)
         start = header.data_start + info.offset
-        state_dict[info.name] = LazyGgufTensor(blob[start : start + info.nbytes], info.ggml_type, shape)
+        state_dict[info.name] = LazyGgufTensor(blob[start : start + info.nbytes], info.ggml_type, shape, logical_shape)
 
     return state_dict
