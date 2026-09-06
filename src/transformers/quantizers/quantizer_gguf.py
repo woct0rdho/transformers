@@ -58,8 +58,21 @@ class GgufHfQuantizer(HfQuantizer):
         # TODO: only for the legacy loader — drop this, and every hook that guards on it, once all
         # architectures go through this path and there is no fallback left
         self.supported = False
+        self._unsupported_distributed_modes = set()
+
+    @staticmethod
+    def _validate_device_map(device_map):
+        # Disk offload is not supported for GGUF files. Loading may apply GGUF-specific conversion operations,
+        # while Accelerate's disk hooks require a checkpoint representation that can be reopened independently.
+        if "disk" in {str(place) for place in getattr(device_map, "values", lambda: [device_map])()}:
+            raise RuntimeError(
+                "One or more modules is configured to be mapped to disk. Disk offload is not supported "
+                "for models loaded from GGUF files."
+            )
 
     def validate_environment(self, *args, **kwargs):
+        # Called both before resolving an automatic device map and after inference has produced its concrete map.
+        self._validate_device_map(kwargs.get("device_map"))
         if not self.supported:
             return
         if self.quantization_config.dequantize:
@@ -75,14 +88,7 @@ class GgufHfQuantizer(HfQuantizer):
 
     def update_device_map(self, device_map):
         """Default to the backend the blocks are computed on, rather than the host."""
-        # Rejected whatever the caller asked for, dequantized loads included, because this is not about
-        # the blocks: a GGUF is one memory-mapped file, so there is no per-layer shard for the offload
-        # machinery to leave on disk and page back in.
-        if "disk" in {str(place) for place in getattr(device_map, "values", lambda: [device_map])()}:
-            raise RuntimeError(
-                "One or more modules is configured to be mapped to disk. Disk offload is not supported "
-                "for models loaded from GGUF files."
-            )
+        self._validate_device_map(device_map)
         if self.quantization_config.dequantize:
             return device_map
         if device_map is None and is_torch_mps_available():
@@ -171,6 +177,41 @@ class GgufHfQuantizer(HfQuantizer):
         # Dropping the weight_conversions related to GGUF ops. When saving, it will fetch back the original specific ops of the model.
         model._weight_conversions = None
         return model
+
+    def _record_unsupported_distributed_modes(self, config):
+        """Collect the parallel modes that cannot hold packed parameters."""
+        distributed_config = getattr(config, "distributed_config", None)
+        if distributed_config is None:
+            return
+
+        def get_option(name, default=None):
+            if isinstance(distributed_config, dict):
+                return distributed_config.get(name, default)
+            return getattr(distributed_config, name, default)
+
+        if (get_option("tp_size") or 1) > 1:
+            self._unsupported_distributed_modes.add("tensor parallelism")
+        if (get_option("fsdp_size") or 1) > 1:
+            self._unsupported_distributed_modes.add("FSDP2")
+        if (get_option("ep_size") or 1) > 1 or get_option("enable_expert_parallel", False):
+            self._unsupported_distributed_modes.add("expert parallelism")
+
+    def update_parallel_plan(self, model, plan):
+        """Reject sharding: a packed parameter is materialized whole and cannot be split across ranks.
+
+        `plan` itself says nothing: a model carries its own predefined plan even when nothing is sharded,
+        so only the distributed configuration decides whether parallelism is actually in play.
+        """
+        if not self.quantization_config.dequantize:
+            self._record_unsupported_distributed_modes(model.config)
+            if self._unsupported_distributed_modes:
+                modes = ", ".join(sorted(self._unsupported_distributed_modes))
+                raise RuntimeError(
+                    f"Native {modes} is not supported for persistent GGUF weights because packed parameters "
+                    "cannot be sharded while loading"
+                )
+            return
+        super().update_parallel_plan(model, plan)
 
     def update_weight_conversions(self, weight_conversions, model):
         """Prepend this file's conversions: the GGUF -> transformers mapping, and the unpacking."""
