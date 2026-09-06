@@ -335,12 +335,16 @@ def register_quantizer(name: str):
     return register_quantizer_fn
 
 
-def get_hf_quantizer(config, quantization_config, device_map, weights_only, user_agent, gguf_file=None):
+def get_hf_quantizer(
+    config, quantization_config, device_map, weights_only, user_agent, gguf_file=None, gguf_mmap_policy=None
+):
     if gguf_file is not None:
         if quantization_config is None:
-            quantization_config = GgufConfig(gguf_file=gguf_file)
+            quantization_config = GgufConfig(gguf_file=gguf_file, mmap_policy=gguf_mmap_policy or "keep")
         elif isinstance(quantization_config, GgufConfig):
             quantization_config.gguf_file = gguf_file
+            if gguf_mmap_policy == "release":
+                quantization_config.mmap_policy = gguf_mmap_policy
     elif isinstance(quantization_config, GgufConfig):
         raise ValueError(
             "Loading a GGUF checkpoint needs the file named as `from_pretrained(..., gguf_file=...)`. "
