@@ -20,7 +20,7 @@ import threading
 import warnings
 from collections.abc import Container
 from math import prod
-from typing import NamedTuple
+from typing import Literal, NamedTuple, overload
 
 import numpy as np
 import torch
@@ -116,12 +116,32 @@ class GgufHeader(NamedTuple):
         return cls(gguf_path, architecture, infos, data_start)
 
 
-def read_gguf_metadata(gguf_path: str, string_arrays: "Container[str]" = ()) -> tuple[dict, tuple[str, ...]]:
-    """A file's metadata keys and tensor names, without reading any tensor data."""
+@overload
+def read_gguf_metadata(
+    gguf_path: str, string_arrays: "Container[str]" = (), return_tensor_shapes: Literal[False] = False
+) -> tuple[dict, tuple[str, ...]]: ...
+
+
+@overload
+def read_gguf_metadata(
+    gguf_path: str, string_arrays: "Container[str]" = (), return_tensor_shapes: Literal[True] = True
+) -> tuple[dict, tuple[str, ...], dict[str, tuple[int, ...]]]: ...
+
+
+def read_gguf_metadata(
+    gguf_path: str, string_arrays: "Container[str]" = (), return_tensor_shapes: bool = False
+) -> tuple[dict, tuple[str, ...]] | tuple[dict, tuple[str, ...], dict[str, tuple[int, ...]]]:
+    """A file's metadata keys and tensor names, without reading any tensor data.
+
+    When ``return_tensor_shapes`` is true, also return the tensor table's logical shapes keyed by GGUF name.
+    """
     blob = _mapped(gguf_path)
     metadata, tensor_count, pos = _read_metadata(blob, gguf_path, string_arrays)
     entries, _ = _read_tensor_table(blob, tensor_count, pos)
-    return metadata, tuple(name for name, *_ in entries)
+    tensor_names = tuple(name for name, *_ in entries)
+    if return_tensor_shapes:
+        return metadata, tensor_names, {name: shape for name, shape, *_ in entries}
+    return metadata, tensor_names
 
 
 def _read_tensor_table(blob: np.ndarray, tensor_count: int, pos: int) -> tuple[list[tuple], int]:
