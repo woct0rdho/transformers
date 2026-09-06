@@ -5,10 +5,11 @@
 import unittest
 
 import torch
+from torch import nn
 
 from transformers.integrations.gguf.dequant import GGML_Q8_0
 from transformers.integrations.gguf.gguf_quantized_parameter import GgufQuantizedParameter
-from transformers.integrations.gguf.modules import GgufGroupedLinear, GgufLinear
+from transformers.integrations.gguf.modules import GgufGroupedLinear, GgufLinear, GgufQwen4ExpIndexerLinear
 
 
 class GgufModuleTests(unittest.TestCase):
@@ -31,6 +32,17 @@ class GgufModuleTests(unittest.TestCase):
         self.assertEqual(tuple(output.shape), (3, 2, 32))
         output.sum().backward()
         self.assertIsNotNone(inputs.grad)
+
+    def test_qwen4_exp_indexer_splits_q_and_k_projection(self):
+        source = nn.Linear(4, 6, bias=False)
+        replacement = GgufQwen4ExpIndexerLinear.from_linear(
+            source, q_out_features=4, k_out_features=2, compute_dtype=torch.float32, floating_weight=True
+        )
+        with torch.no_grad():
+            replacement.q_proj.weight.copy_(source.weight[:4])
+            replacement.k_proj.weight.copy_(source.weight[4:])
+        inputs = torch.randn(3, 4)
+        self.assertTrue(torch.allclose(replacement(inputs), source(inputs)))
 
     def test_tied_output_projection_uses_a_packed_aware_module(self):
         from transformers import Qwen3Config, Qwen3ForCausalLM
