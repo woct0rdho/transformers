@@ -122,7 +122,7 @@ class GgufHfQuantizer(HfQuantizer):
     def get_state_dict(self, checkpoint_file: str, model):
         """The file's tensors, quantized ones kept as raw blocks."""
         if self.supported:
-            return load_gguf_state_dict(self.header)
+            return load_gguf_state_dict(self.header, mmap_policy=self.quantization_config.mmap_policy)
 
         from ..modeling_gguf_pytorch_utils import load_gguf_checkpoint
 
