@@ -223,8 +223,15 @@ class GgufEmbedding(_ComputeDtypeMixin, nn.Embedding):
         raise RuntimeError("GgufEmbedding weight has not been loaded")
 
 
+def _is_expert_candidate(name, module):
+    is_experts_name = name == "experts" or name.endswith(".experts")
+    has_provider = callable(getattr(module, "_get_expert_projection_tensors", None))
+    has_legacy_projections = hasattr(module, "down_proj") and hasattr(module, "gate_up_proj")
+    return is_experts_name and hasattr(module, "config") and (has_provider or has_legacy_projections)
+
+
 def replace_with_gguf_modules(model, compute_dtype=None, floating_checkpoint_params=None, packed_parameter_names=None):
-    """Replace dense model modules before loading so GGUF parameters retain their physical storage."""
+    """Replace model modules before loading so GGUF parameters retain their physical storage."""
     selective = floating_checkpoint_params is not None or packed_parameter_names is not None
     floating_checkpoint_params = set(floating_checkpoint_params or ())
     packed_parameter_names = set(packed_parameter_names or ())
@@ -235,12 +242,28 @@ def replace_with_gguf_modules(model, compute_dtype=None, floating_checkpoint_par
             packed_parameter_names.add(target)
         elif source in floating_checkpoint_params:
             floating_checkpoint_params.add(target)
+    modules = list(model.named_modules())
+    from .moe import GgufExperts
+
+    for name, module in modules:
+        if name and _is_expert_candidate(name, module):
+            GgufExperts._source_module_contract(module)
+
     replacements = {}
-    for name, module in list(model.named_modules()):
+    for name, module in modules:
         if not name or isinstance(module, (GgufLinear, GgufEmbedding)):
             continue
         parameter_name = f"{name}.weight"
-        if isinstance(module, nn.Linear):
+        if _is_expert_candidate(name, module):
+            expert_names = {
+                f"{name}.gate_proj",
+                f"{name}.up_proj",
+                f"{name}.down_proj",
+            }
+            if selective and not expert_names & (packed_parameter_names | floating_checkpoint_params):
+                continue
+            replacement = GgufExperts.from_module(module, compute_dtype=compute_dtype)
+        elif isinstance(module, nn.Linear):
             if (
                 selective
                 and parameter_name not in packed_parameter_names
@@ -265,5 +288,9 @@ def replace_with_gguf_modules(model, compute_dtype=None, floating_checkpoint_par
         parent_name, _, child_name = name.rpartition(".")
         parent = model.get_submodule(parent_name) if parent_name else model
         parent._modules[child_name] = replacement
-        replacements[parameter_name] = replacement
+        if _is_expert_candidate(name, module):
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                replacements[f"{name}.{projection}"] = replacement
+        else:
+            replacements[parameter_name] = replacement
     return replacements

@@ -21,6 +21,7 @@ from .base import HfQuantizer
 if is_torch_available():
     import torch
 
+    from ..core_model_loading import WeightConverter, WeightRenaming
     from ..integrations.gguf.dequant import GGML_BLOCK
     from ..integrations.gguf.kernels import get_gguf_kernel
     from ..integrations.gguf.reader import GgufHeader, load_gguf_state_dict, read_gguf_metadata
@@ -33,6 +34,25 @@ if is_torch_available():
 
 
 logger = logging.get_logger(__name__)
+
+
+def _persistent_conversion_mapping(mapping):
+    """Split fused expert conversions into targets that can retain independent packed tensors."""
+    persistent = []
+    for transform in mapping:
+        if not isinstance(transform, WeightConverter):
+            persistent.append(transform)
+            continue
+        target = transform.target_patterns[0]
+        sources = transform.source_patterns
+        if "experts.gate_up_proj" in target and len(sources) == 2:
+            for source, projection in zip(sources, ("gate_proj", "up_proj")):
+                persistent.append(
+                    WeightRenaming(source, target.replace("experts.gate_up_proj", f"experts.{projection}"))
+                )
+        else:
+            persistent.append(transform)
+    return persistent
 
 
 class GgufHfQuantizer(HfQuantizer):
@@ -135,7 +155,10 @@ class GgufHfQuantizer(HfQuantizer):
         """Swap in `GgufLinear` wherever the weight can stay packed."""
         if not self.supported:
             return model
-        self.mapping = get_gguf_conversion_mapping(self.header.architecture, model.config)
+        mapping = get_gguf_conversion_mapping(self.header.architecture, model.config)
+        if not self.quantization_config.dequantize:
+            mapping = _persistent_conversion_mapping(mapping)
+        self.mapping = mapping
         self.quantized, packable, self.input_permutations, self.names = get_gguf_plan(self.header, self.mapping)
         if self.quantization_config.dequantize:
             return model
