@@ -2095,11 +2095,20 @@ class GgufConfig(QuantizationConfigMixin):
             `from_pretrained(..., gguf_file=...)`, which fills it in.
         dequantize (`bool`, *optional*, defaults to `False`):
             Unpack every weight at load time into a plain dense model instead. Always correct, but
-            gives up the memory saving; this is also the automatic fallback when no matmul kernel is
-            available for the file's quantization types.
+            gives up the memory saving; the persistent path dequantizes per operation instead, so this
+            is an explicit choice rather than a fallback.
+        mmap_policy (`str`, *optional*, defaults to `"keep"`):
+            Keep GGUF file pages resident after loading (`"keep"`) or release complete tensor pages
+            after the loader has detached them (`"release"`).
     """
 
-    def __init__(self, gguf_file: str | None = None, dequantize: bool = False, **kwargs):
+    def __init__(self, gguf_file: str | None = None, dequantize: bool = False, mmap_policy: str = "keep", **kwargs):
+        if mmap_policy not in {"keep", "release"}:
+            raise ValueError(f"GGUF mmap policy must be 'keep' or 'release', got {mmap_policy!r}")
         self.quant_method = QuantizationMethod.GGUF
         self.gguf_file = gguf_file
         self.dequantize = dequantize
+        self.mmap_policy = mmap_policy
+
+    def get_loading_attributes(self):
+        return {"mmap_policy": self.mmap_policy}
