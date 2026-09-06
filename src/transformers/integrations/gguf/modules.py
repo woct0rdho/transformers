@@ -319,15 +319,21 @@ def replace_with_gguf_modules(model, compute_dtype=None, floating_checkpoint_par
         elif source in floating_checkpoint_params:
             floating_checkpoint_params.add(target)
     modules = list(model.named_modules())
-    from .moe import GgufExperts
+    config = getattr(model, "config", None)
+    text_config = config.get_text_config() if config is not None else None
+    model_type = getattr(text_config, "model_type", getattr(config, "model_type", None))
+    if model_type == "deepseek_v4":
+        from .moe import DeepseekV4GgufExperts as experts_class
+    else:
+        from .moe import GgufExperts as experts_class
 
     for name, module in modules:
         if name and _is_expert_candidate(name, module):
-            GgufExperts._source_module_contract(module)
+            experts_class._source_module_contract(module)
 
     replacements = {}
     for name, module in modules:
-        if not name or isinstance(module, (GgufLinear, GgufEmbedding)):
+        if not name or isinstance(module, (GgufLinear, GgufEmbedding, GgufGroupedLinear)):
             continue
         parameter_name = f"{name}.weight"
         if _is_expert_candidate(name, module):
@@ -338,7 +344,17 @@ def replace_with_gguf_modules(model, compute_dtype=None, floating_checkpoint_par
             }
             if selective and not expert_names & (packed_parameter_names | floating_checkpoint_params):
                 continue
-            replacement = GgufExperts.from_module(module, compute_dtype=compute_dtype)
+            replacement = experts_class.from_module(module, compute_dtype=compute_dtype)
+        elif isinstance(module, nn.Linear) and hasattr(module, "n_groups"):
+            if (
+                selective
+                and parameter_name not in packed_parameter_names
+                and parameter_name not in floating_checkpoint_params
+            ):
+                continue
+            replacement = GgufGroupedLinear.from_grouped_linear(
+                module, compute_dtype=compute_dtype, floating_weight=parameter_name in floating_checkpoint_params
+            )
         elif isinstance(module, nn.Linear):
             if (
                 selective
