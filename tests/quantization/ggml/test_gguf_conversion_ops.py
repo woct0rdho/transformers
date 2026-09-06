@@ -104,6 +104,32 @@ class GgufConversionOpsTests(unittest.TestCase):
         self.assertEqual(packable, {})
         self.assertEqual(names, [expected, expected])
 
+    def test_deepseek_auxiliary_names_map_to_native_state(self):
+        from transformers.integrations.gguf.gguf_conversion_mapping import _deepseek_v4
+
+        rules = _deepseek_v4(None)
+        cases = {
+            "blk.0.indexer.attn_q_b.weight": "model.layers.0.self_attn.compressor.indexer.q_b_proj.weight",
+            "blk.3.exp_probs_b.bias": "model.layers.3.mlp.gate.e_score_correction_bias",
+            "blk.4.indexer_compressor_ape.weight": "model.layers.4.self_attn.compressor.indexer.position_bias",
+        }
+        for source, expected in cases.items():
+            name = source
+            for rule in rules:
+                name, _ = rule.rename_source_key(name)
+            self.assertEqual(name, expected)
+
+    def test_deepseek_final_norm_survives_native_mapping(self):
+        from transformers.conversion_mapping import get_checkpoint_conversion_mapping
+        from transformers.core_model_loading import rename_source_key
+        from transformers.integrations.gguf.gguf_conversion_mapping import _deepseek_v4
+
+        rules = _deepseek_v4(None) + get_checkpoint_conversion_mapping("deepseek_v4")
+        renamings = [rule for rule in rules if isinstance(rule, WeightRenaming)]
+        converters = [rule for rule in rules if isinstance(rule, WeightConverter)]
+        name, _ = rename_source_key("output_norm.weight", renamings, converters)
+        self.assertEqual(name, "model.norm.weight")
+
     def test_packed_row_permutation_preserves_metadata(self):
         packed = GgufQuantizedParameter(torch.zeros(2, 34, dtype=torch.uint8), GGML_Q8_0, (2, 32))
         result = PermuteRows(torch.tensor([1, 0])).convert({"weight": packed}, ["weight"], ["weight"])["weight"]

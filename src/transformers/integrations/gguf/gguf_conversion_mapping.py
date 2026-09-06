@@ -241,12 +241,55 @@ def _qwen35_moe(config):
     ]
 
 
+def _deepseek_v4(config):
+    return [
+        WeightRenaming(r"^blk\.", "model.layers."),
+        WeightRenaming(r"^token_embd\.weight", "model.embed_tokens.weight"),
+        WeightRenaming(r"^output_norm\.weight", "model.norm.weight"),
+        WeightRenaming(r"^output\.weight", "lm_head.weight"),
+        WeightRenaming(r"^output_hc_fn\.weight", "model.hc_head.hc_fn"),
+        WeightRenaming(r"^output_hc_base\.weight", "model.hc_head.hc_base"),
+        WeightRenaming(r"^output_hc_scale\.weight", "model.hc_head.hc_scale"),
+        WeightRenaming(r"\.attn_norm\.weight", ".input_layernorm.weight"),
+        WeightRenaming(r"\.ffn_norm\.weight", ".post_attention_layernorm.weight"),
+        WeightRenaming(r"\.hc_attn_(fn|base|scale)\.weight", r".attn_hc.\1"),
+        WeightRenaming(r"\.hc_ffn_(fn|base|scale)\.weight", r".ffn_hc.\1"),
+        WeightRenaming(r"\.attn_q_a\.weight", ".self_attn.q_a_proj.weight"),
+        WeightRenaming(r"\.attn_q_a_norm\.weight", ".self_attn.q_a_norm.weight"),
+        WeightRenaming(r"\.indexer\.attn_q_b\.weight", ".self_attn.compressor.indexer.q_b_proj.weight"),
+        WeightRenaming(r"(?<!indexer)\.attn_q_b\.weight", ".self_attn.q_b_proj.weight"),
+        WeightRenaming(r"\.attn_kv\.weight", ".self_attn.kv_proj.weight"),
+        WeightRenaming(r"\.attn_kv_a_norm\.weight", ".self_attn.kv_norm.weight"),
+        WeightRenaming(r"\.attn_output_a\.weight", ".self_attn.o_a_proj.weight"),
+        WeightRenaming(r"\.attn_output_b\.weight", ".self_attn.o_b_proj.weight"),
+        WeightRenaming(r"\.attn_sinks\.weight", ".self_attn.sinks"),
+        WeightRenaming(r"\.ffn_gate_inp\.weight", ".mlp.gate.weight"),
+        WeightRenaming(r"\.ffn_gate_tid2eid\.weight", ".mlp.gate.tid2eid"),
+        WeightRenaming(r"\.exp_probs_b\.bias", ".mlp.gate.e_score_correction_bias"),
+        WeightRenaming(r"\.ffn_(gate|up|down)_shexp\.weight", r".mlp.shared_experts.\1_proj.weight"),
+        WeightRenaming(r"\.ffn_down_exps\.weight", ".mlp.experts.down_proj"),
+        WeightConverter(
+            source_patterns=[r"\.ffn_gate_exps\.weight", r"\.ffn_up_exps\.weight"],
+            target_patterns=".mlp.experts.gate_up_proj",
+            operations=[Concatenate(dim=1)],
+        ),
+        WeightRenaming(r"\.attn_compressor_ape\.weight", ".self_attn.compressor.position_bias"),
+        WeightRenaming(r"\.attn_compressor_(kv|gate)\.weight", r".self_attn.compressor.\1_proj.weight"),
+        WeightRenaming(r"\.attn_compressor_norm\.weight", ".self_attn.compressor.kv_norm.weight"),
+        WeightRenaming(r"\.indexer\.proj\.weight", ".self_attn.compressor.indexer.scorer.weights_proj.weight"),
+        WeightRenaming(r"\.indexer_compressor_ape\.weight", ".self_attn.compressor.indexer.position_bias"),
+        WeightRenaming(r"\.indexer_compressor_(kv|gate)\.weight", r".self_attn.compressor.indexer.\1_proj.weight"),
+        WeightRenaming(r"\.indexer_compressor_norm\.weight", ".self_attn.compressor.indexer.kv_norm.weight"),
+    ]
+
+
 # gguf `general.architecture` -> builder taking the model config
 GGUF_ARCHS = {
     "qwen3": lambda config: _standard_decoder(config),
     "qwen3moe": lambda config: _standard_decoder(config, moe=True),
     "qwen35": _qwen35,
     "qwen35moe": _qwen35_moe,
+    "deepseek4": _deepseek_v4,
 }
 
 
