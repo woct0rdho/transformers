@@ -8,7 +8,7 @@ import torch
 
 from transformers.integrations.gguf.dequant import GGML_Q8_0
 from transformers.integrations.gguf.gguf_quantized_parameter import GgufQuantizedParameter
-from transformers.integrations.gguf.modules import GgufLinear
+from transformers.integrations.gguf.modules import GgufGroupedLinear, GgufLinear
 
 
 class GgufModuleTests(unittest.TestCase):
@@ -22,6 +22,15 @@ class GgufModuleTests(unittest.TestCase):
         self.assertIsNotNone(inputs.grad)
         self.assertFalse(module.weight.requires_grad)
         self.assertIsNone(module.weight.grad)
+
+    def test_grouped_linear_preserves_group_axis(self):
+        module = GgufGroupedLinear(32, 64, 2, compute_dtype=torch.float32)
+        module.weight = GgufQuantizedParameter(torch.zeros(64, 34, dtype=torch.uint8), GGML_Q8_0, (64, 32))
+        inputs = torch.randn(3, 2, 32, requires_grad=True)
+        output = module(inputs)
+        self.assertEqual(tuple(output.shape), (3, 2, 32))
+        output.sum().backward()
+        self.assertIsNotNone(inputs.grad)
 
     def test_tied_output_projection_uses_a_packed_aware_module(self):
         from transformers import Qwen3Config, Qwen3ForCausalLM
