@@ -217,11 +217,11 @@ class GgufHfQuantizer(HfQuantizer):
 
     @property
     def is_trainable(self) -> bool:
-        return False
+        return self.supported and not self.quantization_config.dequantize
 
     @property
     def is_compileable(self) -> bool:
-        return True
+        return not self.supported or self.quantization_config.dequantize
 
     def is_serializable(self, safe_serialization=None) -> bool:
         return False
