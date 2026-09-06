@@ -240,6 +240,16 @@ _GPT4O_SPLIT = (
     r"|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
 
+# ggml's `LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM`, which llama.cpp shares with the DeepSeek3, Hunyuan-dense
+# and hy_v4 pre-types: an alternation of the three patterns it installs as a set.
+_JOYAI_LLM_SPLIT = (
+    r"\p{N}{1,3}"
+    r"|[一-龥぀-ゟ゠-ヿ]+"
+    r"|[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+"
+    r"|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
 GGUF_PRE_TOKENIZER_SPLITS = {
     "llama3": _LLAMA3_SPLIT,
     "llama-v3": _LLAMA3_SPLIT,
@@ -250,6 +260,7 @@ GGUF_PRE_TOKENIZER_SPLITS = {
     "midm-2.0": _LLAMA3_SPLIT,
     "lfm2": _LLAMA3_SPLIT,
     "jina-v5-nano": _LLAMA3_SPLIT,
+    "joyai-llm": _JOYAI_LLM_SPLIT,
     "dbrx": _LLAMA3_SPLIT,
     "smaug-bpe": _LLAMA3_SPLIT,
     "tekken": _TEKKEN_SPLIT,
