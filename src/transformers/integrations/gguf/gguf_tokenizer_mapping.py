@@ -27,6 +27,7 @@ GGUF_TOKENIZER_ARCHS = {
     "qwen3moe": "qwen3_moe",
     "qwen35": "qwen3_5_text",
     "qwen35moe": "qwen3_5_text",
+    "deepseek4": "qwen3",
 }
 
 # The metadata arrays a tokenizer needs in full; everything else the reader can leave as a count.
