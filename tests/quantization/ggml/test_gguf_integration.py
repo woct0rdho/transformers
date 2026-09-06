@@ -225,7 +225,7 @@ class GgufIntegrationTest(unittest.TestCase):
 
     @staticmethod
     def packed_modules(model):
-        from transformers.integrations.gguf.utils import GgufEmbedding, GgufLinear
+        from transformers.integrations.gguf.modules import GgufEmbedding, GgufLinear
 
         return [module for module in model.modules() if isinstance(module, (GgufLinear, GgufEmbedding))]
 
@@ -247,11 +247,11 @@ class GgufIntegrationTest(unittest.TestCase):
         self.assertIn("Berlin", self.generates(model))
 
     def test_runs_without_a_kernel(self):
-        """No kernel: nothing can compute on blocks, so the whole model is unpacked at load."""
+        """The torch dequantization path keeps blocks usable without a fused kernel."""
         with unittest.mock.patch("transformers.quantizers.quantizer_gguf.get_gguf_kernel", return_value=False):
             model = self.load(device_map=torch_device)
 
-        self.assertEqual(self.packed_modules(model), [], "blocks were kept with nothing able to read them")
+        self.assertTrue(self.packed_modules(model), "the torch fallback did not retain packed modules")
         self.assertIn("Berlin", self.generates(model))
 
     def test_load_accounts_for_every_key(self):
