@@ -1015,9 +1015,11 @@ class PreTrainedConfig(PushToHubMixin, RotaryEmbeddingConfigMixin, Heterogeneous
                 # reader covers rebuild it from those keys; the rest go to the legacy reader.
                 from .integrations.gguf import GGUF_CONFIG_ARCHS, get_gguf_config, read_gguf_metadata
 
-                metadata, tensor_names = read_gguf_metadata(resolved_config_file)
+                metadata, tensor_names, tensor_shapes = read_gguf_metadata(
+                    resolved_config_file, return_tensor_shapes=True
+                )
                 if metadata["general.architecture"] in GGUF_CONFIG_ARCHS:
-                    config_dict = get_gguf_config(metadata, tensor_names)
+                    config_dict = get_gguf_config(metadata, tensor_names, tensor_shapes)
                 else:
                     from .modeling_gguf_pytorch_utils import load_gguf_checkpoint
 
