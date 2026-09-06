@@ -10,7 +10,7 @@ import torch
 
 from transformers.core_model_loading import WeightConverter, WeightRenaming
 from transformers.integrations.gguf.dequant import GGML_BLOCK, GGML_Q4_K
-from transformers.integrations.gguf.gguf_conversion_mapping import Concatenate
+from transformers.integrations.gguf.gguf_conversion_mapping import GGUF_ARCHS, Concatenate
 from transformers.modeling_utils import PreTrainedModel
 from transformers.quantizers.quantizer_gguf import GgufHfQuantizer, _persistent_conversion_mapping
 from transformers.utils.quantization_config import GgufConfig
@@ -119,6 +119,31 @@ class GgufLoaderTests(unittest.TestCase):
         self.assertIn(".mlp.experts.gate_proj", targets)
         self.assertIn(".mlp.experts.up_proj", targets)
         self.assertNotIn(".mlp.experts.gate_up_proj", targets)
+
+    def test_persistent_mapping_splits_qwen4_indexer_targets(self):
+        config = SimpleNamespace(
+            get_text_config=lambda: SimpleNamespace(
+                linear_num_key_heads=2,
+                linear_num_value_heads=4,
+                linear_key_head_dim=4,
+                linear_value_head_dim=4,
+                num_hidden_layers=2,
+                ple_layer_ids=[],
+            )
+        )
+        mapping = _persistent_conversion_mapping(GGUF_ARCHS["qwen4exp"](config))
+        targets = {
+            rule.target_patterns[0]
+            for rule in mapping
+            if isinstance(rule, WeightRenaming) and "index_qk_proj" in rule.target_patterns[0]
+        }
+        self.assertEqual(
+            targets,
+            {
+                ".self_attn.indexer.index_qk_proj.q_proj.weight",
+                ".self_attn.indexer.index_qk_proj.k_proj.weight",
+            },
+        )
 
     def test_quantizer_resolves_the_model_dtype_plan(self):
         class _Model:
