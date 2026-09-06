@@ -21,6 +21,7 @@ from .base import HfQuantizer
 if is_torch_available():
     import torch
 
+    from ..integrations.gguf.dequant import GGML_BLOCK
     from ..integrations.gguf.kernels import get_gguf_kernel
     from ..integrations.gguf.reader import GgufHeader, load_gguf_state_dict, read_gguf_metadata
     from ..integrations.gguf.utils import (
@@ -28,7 +29,6 @@ if is_torch_available():
         get_gguf_conversion_mapping,
         get_gguf_plan,
         is_gguf_arch_supported,
-        replace_with_gguf_modules,
     )
 
 
@@ -69,11 +69,8 @@ class GgufHfQuantizer(HfQuantizer):
             # ordinary dense model, and no fallback happened, so there is nothing to warn about.
             self.quantization_config.dequantize = True
             return
+        # The persistent modules have a torch dequantization path, so a fused kernel is optional.
         self.kernel = get_gguf_kernel()
-        if not self.kernel:
-            self.quantization_config.dequantize = True
-            logger.warning("No GGUF matmul kernel is available for this device. We will dequantize the entire model.")
-            return
 
     def update_device_map(self, device_map):
         """Default to the backend the blocks are computed on, rather than the host."""
@@ -125,12 +122,21 @@ class GgufHfQuantizer(HfQuantizer):
     def _process_model_before_weight_loading(self, model, **kwargs):
         """Swap in `GgufLinear` wherever the weight can stay packed."""
         if not self.supported:
-            return
+            return model
         self.mapping = get_gguf_conversion_mapping(self.header.architecture, model.config)
         self.quantized, packable, self.input_permutations, self.names = get_gguf_plan(self.header, self.mapping)
         if self.quantization_config.dequantize:
-            return
-        self.packed_modules = replace_with_gguf_modules(model, packable, self.kernel, self.dtype)
+            return model
+        floating = set(self.names) - set(self.quantized)
+        from ..integrations.gguf.modules import replace_with_gguf_modules
+
+        self.packed_modules = replace_with_gguf_modules(
+            model,
+            compute_dtype=self.dtype,
+            packed_parameter_names=set(packable),
+            floating_checkpoint_params=floating,
+        )
+        return model
 
     def _process_model_after_weight_loading(self, model, **kwargs):
         """Fill in what needs the weights already in place: the input permutations, then the layer kernels."""
@@ -155,8 +161,19 @@ class GgufHfQuantizer(HfQuantizer):
         """Prepend this file's conversions: the GGUF -> transformers mapping, and the unpacking."""
         if not self.supported:
             return weight_conversions
-        to_unpack = {name: t for name, t in self.quantized.items() if name not in self.packed_modules}
+        packed_params = set(self.packed_modules)
+        to_unpack = {name: t for name, t in self.quantized.items() if name not in packed_params}
         return add_gguf_load_ops(self.mapping + weight_conversions, to_unpack, self.names, self.dtype)
+
+    def param_element_size(self, model, param_name: str, param: "torch.Tensor") -> float:
+        """Report packed bytes per logical element for parameters retained in GGUF blocks."""
+        if not self.supported or self.quantization_config.dequantize or param_name not in self.packed_modules:
+            return super().param_element_size(model, param_name, param)
+        quant_type = self.quantized.get(param_name)
+        if quant_type is None:
+            return super().param_element_size(model, param_name, param)
+        block_elements, block_bytes = GGML_BLOCK[quant_type]
+        return block_bytes / block_elements
 
     def param_needs_quantization(self, model, param_name: str, **kwargs) -> bool:
         return False
