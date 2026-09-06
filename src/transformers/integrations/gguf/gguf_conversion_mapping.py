@@ -188,9 +188,28 @@ class Concatenate(ConversionOps):
         return {target_patterns[0]: torch.cat(tensors, dim=self.dim)}
 
 
+def _qwen35_moe(config):
+    return _qwen35(config) + [
+        WeightRenaming(r"\.ffn_gate_inp\.", ".mlp.gate."),
+        WeightRenaming(r"\.ffn_down_exps\.weight", ".mlp.experts.down_proj"),
+        WeightConverter(
+            source_patterns=r"\.ffn_gate_inp_shexp\.weight",
+            target_patterns=".mlp.shared_expert_gate.weight",
+            operations=[Unsqueeze(0)],
+        ),
+        WeightRenaming(r"\.ffn_(gate|up|down)_shexp\.weight", r".mlp.shared_expert.\1_proj.weight"),
+        WeightConverter(
+            source_patterns=[r"\.ffn_gate_exps\.weight", r"\.ffn_up_exps\.weight"],
+            target_patterns=".mlp.experts.gate_up_proj",
+            operations=[Concatenate(dim=1)],
+        ),
+    ]
+
+
 # gguf `general.architecture` -> builder taking the model config
 GGUF_ARCHS = {
     "qwen35": _qwen35,
+    "qwen35moe": _qwen35_moe,
 }
 
 
@@ -220,7 +239,7 @@ class LogNegate(ConversionOps):
 
 
 class Unsqueeze(ConversionOps):
-    """Add a size-1 dim, undoing llama.cpp squeezing `conv1d` from `(C, 1, K)` to `(C, K)`."""
+    """Add a size-1 dim, undoing llama.cpp squeezing dimensions of size one."""
 
     def __init__(self, dim: int):
         self.dim = dim
