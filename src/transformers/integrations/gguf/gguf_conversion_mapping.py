@@ -289,12 +289,78 @@ def _deepseek_v4(config):
     ]
 
 
+def _qwen4_exp(config):
+    text_config = config.get_text_config()
+    ple_layer_ids = getattr(text_config, "ple_layer_ids", []) or []
+    if len(ple_layer_ids) > 1:
+        raise ValueError("Qwen4-Exp GGUF loading supports only one PLE layer")
+    ple_mapping = []
+    if ple_layer_ids:
+        ple_mapping.append(
+            WeightRenaming(
+                r"^per_layer_token_embd\.weight$",
+                f"model.layers.{int(ple_layer_ids[0]) - 1}.ple.ple_embedding.ngram_embedding.weight",
+            )
+        )
+    return (
+        _qwen35_moe(config)
+        + ple_mapping
+        + [
+            WeightConverter(
+                source_patterns=r"^output_hc_norm\.weight",
+                target_patterns="model.hyper_connection_mixer.hc_norm.weight",
+                operations=[SubtractOne()],
+            ),
+            WeightRenaming(r"^output_hc_down\.weight", "model.hyper_connection_mixer.input_mix_weight_down.weight"),
+            WeightRenaming(r"^output_hc_up\.weight", "model.hyper_connection_mixer.input_mix_weight_up.weight"),
+            WeightConverter(
+                source_patterns=r"\.hc_attn_norm\.weight",
+                target_patterns=".attn_hyper_connection.hc_norm.weight",
+                operations=[SubtractOne()],
+            ),
+            WeightRenaming(r"\.hc_attn_down\.weight", ".attn_hyper_connection.input_mix_weight_down.weight"),
+            WeightRenaming(r"\.hc_attn_up\.weight", ".attn_hyper_connection.input_mix_weight_up.weight"),
+            WeightRenaming(r"\.hc_attn_inject\.weight", ".attn_hyper_connection.block_inject_weight.weight"),
+            WeightConverter(
+                source_patterns=r"\.hc_ffn_norm\.weight",
+                target_patterns=".mlp_hyper_connection.hc_norm.weight",
+                operations=[SubtractOne()],
+            ),
+            WeightRenaming(r"\.hc_ffn_down\.weight", ".mlp_hyper_connection.input_mix_weight_down.weight"),
+            WeightRenaming(r"\.hc_ffn_up\.weight", ".mlp_hyper_connection.input_mix_weight_up.weight"),
+            WeightRenaming(r"\.hc_ffn_inject\.weight", ".mlp_hyper_connection.block_inject_weight.weight"),
+            WeightConverter(
+                source_patterns=[r"\.indexer\.q_proj\.weight", r"\.indexer\.k_proj\.weight"],
+                target_patterns=".self_attn.indexer.index_qk_proj.weight",
+                operations=[Concatenate(dim=0)],
+            ),
+            WeightConverter(
+                source_patterns=r"\.indexer\.q_norm\.weight",
+                target_patterns=".self_attn.indexer.q_layernorm.weight",
+                operations=[SubtractOne()],
+            ),
+            WeightConverter(
+                source_patterns=r"\.indexer\.k_norm\.weight",
+                target_patterns=".self_attn.indexer.k_layernorm.weight",
+                operations=[SubtractOne()],
+            ),
+            WeightRenaming(r"\.ple_key\.weight", ".ple.key_proj.weight"),
+            WeightRenaming(r"\.ple_value\.weight", ".ple.value_proj.weight"),
+            WeightConverter(r"\.ple_norm_key\.weight", ".ple.norm_key.weight", [SubtractOne()]),
+            WeightConverter(r"\.ple_norm_query\.weight", ".ple.norm_query.weight", [SubtractOne()]),
+            WeightConverter(r"\.ple_norm_conv\.weight", ".ple.norm_conv.weight", [SubtractOne()]),
+            WeightConverter(r"\.ple_conv1d\.weight", ".ple.conv1d.weight", [Unsqueeze(1)]),
+        ]
+    )
+
+
 # gguf `general.architecture` -> builder taking the model config
 GGUF_ARCHS = {
     "qwen3": lambda config: _standard_decoder(config),
     "qwen3moe": lambda config: _standard_decoder(config, moe=True),
     "qwen35": _qwen35,
     "qwen35moe": _qwen35_moe,
+    "qwen4exp": _qwen4_exp,
     "deepseek4": _deepseek_v4,
 }
 

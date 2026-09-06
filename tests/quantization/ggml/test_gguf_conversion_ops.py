@@ -133,6 +133,22 @@ class GgufConversionOpsTests(unittest.TestCase):
         name, _ = rename_source_key("output_norm.weight", renamings, converters)
         self.assertEqual(name, "model.norm.weight")
 
+    def test_qwen4_exp_ple_source_maps_to_native_embedding(self):
+        text_config = SimpleNamespace(
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            num_hidden_layers=2,
+            ple_layer_ids=[2],
+        )
+        config = SimpleNamespace(get_text_config=lambda: text_config)
+        rules = GGUF_ARCHS["qwen4exp"](config)
+        name = "per_layer_token_embd.weight"
+        for rule in rules:
+            name, _ = rule.rename_source_key(name)
+        self.assertEqual(name, "model.layers.1.ple.ple_embedding.ngram_embedding.weight")
+
     def test_packed_row_permutation_preserves_metadata(self):
         packed = GgufQuantizedParameter(torch.zeros(2, 34, dtype=torch.uint8), GGML_Q8_0, (2, 32))
         result = PermuteRows(torch.tensor([1, 0])).convert({"weight": packed}, ["weight"], ["weight"])["weight"]

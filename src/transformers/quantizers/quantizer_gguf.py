@@ -37,7 +37,7 @@ logger = logging.get_logger(__name__)
 
 
 def _persistent_conversion_mapping(mapping):
-    """Split fused expert conversions into targets that can retain independent packed tensors."""
+    """Split packed-incompatible fan-in conversions into independent persistent targets."""
     persistent = []
     for transform in mapping:
         if not isinstance(transform, WeightConverter):
@@ -49,6 +49,14 @@ def _persistent_conversion_mapping(mapping):
             for source, projection in zip(sources, ("gate_proj", "up_proj")):
                 persistent.append(
                     WeightRenaming(source, target.replace("experts.gate_up_proj", f"experts.{projection}"))
+                )
+        elif "index_qk_proj" in target and len(sources) == 2:
+            for source, projection in zip(sources, ("q_proj", "k_proj")):
+                persistent.append(
+                    WeightRenaming(
+                        source,
+                        target.replace("index_qk_proj.weight", f"index_qk_proj.{projection}.weight"),
+                    )
                 )
         else:
             persistent.append(transform)
