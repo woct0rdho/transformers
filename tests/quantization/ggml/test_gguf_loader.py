@@ -8,8 +8,10 @@ from unittest.mock import patch
 
 import torch
 
+from transformers.core_model_loading import WeightConverter, WeightRenaming
 from transformers.integrations.gguf.dequant import GGML_BLOCK, GGML_Q4_K
-from transformers.quantizers.quantizer_gguf import GgufHfQuantizer
+from transformers.integrations.gguf.gguf_conversion_mapping import Concatenate
+from transformers.quantizers.quantizer_gguf import GgufHfQuantizer, _persistent_conversion_mapping
 from transformers.utils.quantization_config import GgufConfig
 
 
@@ -97,6 +99,25 @@ class GgufLoaderTests(unittest.TestCase):
                     patch.object(quantizer, "validate_environment"),
                 ):
                     quantizer.read_header("unused.gguf")
+
+    def test_persistent_mapping_splits_fused_expert_targets(self):
+        mapping = _persistent_conversion_mapping(
+            [
+                WeightConverter(
+                    source_patterns=[".ffn_gate_exps.weight", ".ffn_up_exps.weight"],
+                    target_patterns=".mlp.experts.gate_up_proj",
+                    operations=[Concatenate(dim=1)],
+                )
+            ]
+        )
+        targets = {
+            rule.target_patterns[0]
+            for rule in mapping
+            if isinstance(rule, WeightRenaming) and "experts." in rule.target_patterns[0]
+        }
+        self.assertIn(".mlp.experts.gate_proj", targets)
+        self.assertIn(".mlp.experts.up_proj", targets)
+        self.assertNotIn(".mlp.experts.gate_up_proj", targets)
 
 
 if __name__ == "__main__":
