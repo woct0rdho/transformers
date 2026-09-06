@@ -28,6 +28,47 @@ def _required(metadata, *keys):
     raise ValueError(f"GGUF metadata is missing required field {keys[0]!r}")
 
 
+def _standard_config(metadata, tensor_names, architecture, model_type, moe=False):
+    key = lambda name: metadata[f"{architecture}.{name}"]  # noqa: E731
+    vocab_size = metadata.get("tokenizer.ggml.tokens")
+    if vocab_size is None:
+        vocab_size = key("vocab_size")
+    num_attention_heads = int(key("attention.head_count"))
+    head_dim = metadata.get(f"{architecture}.attention.key_length")
+    if head_dim is None:
+        head_dim = key("embedding_length") // num_attention_heads
+    config = {
+        "model_type": model_type,
+        "architectures": ["Qwen3MoeForCausalLM" if moe else "Qwen3ForCausalLM"],
+        "max_position_embeddings": key("context_length"),
+        "hidden_size": key("embedding_length"),
+        "intermediate_size": key("feed_forward_length"),
+        "num_hidden_layers": key("block_count"),
+        "num_attention_heads": num_attention_heads,
+        "num_key_value_heads": key("attention.head_count_kv"),
+        "rms_norm_eps": key("attention.layer_norm_rms_epsilon"),
+        "head_dim": head_dim,
+        "rope_parameters": {"rope_type": "default", "rope_theta": key("rope.freq_base")},
+        "vocab_size": vocab_size,
+        "tie_word_embeddings": "output.weight" not in tensor_names,
+        "eos_token_id": metadata.get("tokenizer.ggml.eos_token_id"),
+        "bos_token_id": metadata.get("tokenizer.ggml.bos_token_id"),
+        "pad_token_id": metadata.get("tokenizer.ggml.padding_token_id"),
+    }
+    if moe:
+        config.update({"num_experts": key("expert_count"), "num_experts_per_tok": key("expert_used_count")})
+        config["norm_topk_prob"] = True
+    return config
+
+
+def _qwen3_config(metadata, tensor_names):
+    return _standard_config(metadata, tensor_names, "qwen3", "qwen3")
+
+
+def _qwen3_moe_config(metadata, tensor_names):
+    return _standard_config(metadata, tensor_names, "qwen3moe", "qwen3_moe", moe=True)
+
+
 def _qwen35_moe_config(metadata, tensor_names):
     prefix = "qwen35moe" if "qwen35moe.expert_count" in metadata else "qwen35"
     config = _qwen35_config(metadata, tensor_names, architecture=prefix)
@@ -141,6 +182,8 @@ def _qwen35_config(metadata, tensor_names, architecture="qwen35", require_interv
 
 
 GGUF_CONFIG_ARCHS = {
+    "qwen3": _qwen3_config,
+    "qwen3moe": _qwen3_moe_config,
     "qwen35": _qwen35_config,
     "qwen35moe": _qwen35_moe_config,
 }

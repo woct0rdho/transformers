@@ -23,6 +23,8 @@ from .reader import read_gguf_metadata
 
 # `general.architecture` -> the `model_type` whose `GGUF_TO_FAST_CONVERTERS` entry reads this vocabulary.
 GGUF_TOKENIZER_ARCHS = {
+    "qwen3": "qwen3",
+    "qwen3moe": "qwen3_moe",
     "qwen35": "qwen3_5_text",
     "qwen35moe": "qwen3_5_text",
 }
