@@ -773,9 +773,9 @@ class AutoTokenizer:
             from ...integrations.gguf import GGUF_CONFIG_ARCHS, get_gguf_config, read_gguf_metadata
 
             gguf_path = cached_file(pretrained_model_name_or_path, gguf_file, **kwargs)
-            metadata, tensor_names = read_gguf_metadata(gguf_path)
+            metadata, tensor_names, tensor_shapes = read_gguf_metadata(gguf_path, return_tensor_shapes=True)
             if metadata["general.architecture"] in GGUF_CONFIG_ARCHS:
-                config_dict = get_gguf_config(metadata, tensor_names)
+                config_dict = get_gguf_config(metadata, tensor_names, tensor_shapes)
             else:
                 config_dict = load_gguf_checkpoint(gguf_path, return_tensors=False)["config"]
             config = AutoConfig.for_model(**config_dict)

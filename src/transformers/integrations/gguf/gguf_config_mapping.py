@@ -324,16 +324,214 @@ def _deepseek_v4_config(metadata, tensor_names):
     }
 
 
+def _qwen4_exp_config(metadata, tensor_names, tensor_shapes=None):
+    prefix = "qwen4exp"
+    config = _qwen35_config(metadata, tensor_names, architecture=prefix, require_interval=False)
+    config.update(
+        {
+            "model_type": "qwen4_exp_text",
+            "architectures": ["Qwen4ExpForCausalLM"],
+            # Qwen4-Exp's GGUF graph uses a sigmoid output gate, but GGUF has no activation metadata.
+            "output_gate_type": "sigmoid",
+            "hc_count": _required(metadata, f"{prefix}.hyper_connection.count", f"{prefix}.hc_count"),
+            "hc_lowrank": _required(metadata, f"{prefix}.hyper_connection.low_rank", f"{prefix}.hc_lowrank"),
+            "indexer_n_heads": _required(
+                metadata, f"{prefix}.attention.indexer.head_count", f"{prefix}.indexer_n_heads"
+            ),
+            "indexer_kv_heads": 1,
+            "indexer_head_dim": _required(
+                metadata, f"{prefix}.attention.indexer.key_length", f"{prefix}.indexer_head_dim"
+            ),
+            "indexer_budget": _required(metadata, f"{prefix}.attention.indexer.top_k", f"{prefix}.indexer_budget"),
+            "num_experts": _required(metadata, f"{prefix}.expert_count"),
+            "num_experts_per_tok": _required(metadata, f"{prefix}.expert_used_count"),
+            "moe_intermediate_size": _required(
+                metadata, f"{prefix}.expert_feed_forward_length", f"{prefix}.moe_intermediate_size"
+            ),
+            "shared_expert_intermediate_size": _required(
+                metadata, f"{prefix}.expert_shared_feed_forward_length", f"{prefix}.shared_expert_intermediate_size"
+            ),
+        }
+    )
+    ratios = _required(metadata, f"{prefix}.attention.compress_ratios")
+    if not isinstance(ratios, list) or len(ratios) != config["num_hidden_layers"]:
+        raise ValueError("Qwen4-Exp GGUF attention.compress_ratios must contain one entry per layer")
+    positive = sorted({int(ratio) for ratio in ratios if int(ratio) > 0})
+    if any(int(ratio) < 0 for ratio in ratios) or len(positive) != 1:
+        raise ValueError("Qwen4-Exp GGUF requires exactly one positive compression ratio and non-negative entries")
+    config["indexer_compress_ratio"] = positive[0]
+    if config["indexer_budget"] % positive[0]:
+        raise ValueError("Qwen4-Exp GGUF indexer budget must be divisible by its compression ratio")
+    config["layer_types"] = ["qwen_sparse_attention" if int(ratio) else "linear_attention" for ratio in ratios]
+
+    ple_layers = metadata.get(f"{prefix}.ple.layers", [])
+    ple_layers = ple_layers if isinstance(ple_layers, list) else [ple_layers]
+    if len(ple_layers) > 1:
+        raise ValueError("Qwen4-Exp GGUF loading supports only one PLE layer")
+    config["ple_layer_ids"] = [int(ple_layers[0]) + 1] if ple_layers else []
+    if ple_layers:
+        layer = int(ple_layers[0])
+        if not 0 <= layer < config["num_hidden_layers"] or config["layer_types"][layer] != "linear_attention":
+            raise ValueError("Qwen4-Exp GGUF PLE must target one valid recurrent layer")
+        ngram_size = _required(metadata, f"{prefix}.ple.ngram_size")
+        heads_per_ngram = _required(metadata, f"{prefix}.ple.heads_per_ngram")
+        multipliers = _required(metadata, f"{prefix}.ple.layer_multipliers")
+        offsets = _required(metadata, f"{prefix}.ple.head_offsets")
+        vocab_sizes = _required(metadata, f"{prefix}.ple.head_vocab_sizes")
+        ngram_heads = (ngram_size - 1) * heads_per_ngram
+        if len(multipliers) != ngram_size or len(offsets) != ngram_heads or len(vocab_sizes) != ngram_heads:
+            raise ValueError("Qwen4-Exp GGUF PLE metadata has inconsistent hash-head lengths")
+        expected = 0
+        for offset, vocab_size in zip(offsets, vocab_sizes):
+            if int(offset) != expected or int(vocab_size) <= 0:
+                raise ValueError("Qwen4-Exp GGUF PLE head ranges must be contiguous positive intervals")
+            expected += int(vocab_size)
+        ple_head_dim = int(_required(metadata, f"{prefix}.embedding_length_per_layer_input"))
+        ple_table_shape = (tensor_shapes or {}).get("per_layer_token_embd.weight")
+        if ple_table_shape is not None:
+            if len(ple_table_shape) != 2 or int(ple_table_shape[1]) != ple_head_dim:
+                raise ValueError("Qwen4-Exp GGUF PLE embedding shape must match embedding_length_per_layer_input")
+            if int(ple_table_shape[0]) < expected:
+                raise ValueError("Qwen4-Exp GGUF PLE embedding has fewer rows than its head ranges require")
+            ple_vocab_size = int(ple_table_shape[0])
+        else:
+            # GGUF does not carry the padding divisor separately; Qwen4-Exp's PLE table uses its
+            # default 128-row alignment.
+            ple_vocab_size = ((expected + 127) // 128) * 128
+        config.update(
+            {
+                "ngram_size": ngram_size,
+                "heads_per_ngram": heads_per_ngram,
+                "ple_conv_kernel_size": _required(metadata, f"{prefix}.ple.conv_kernel"),
+                "ple_embed_dim": ple_head_dim * ngram_heads,
+                "ple_layer_multipliers": [int(value) for value in multipliers],
+                "ple_head_offsets": [int(value) for value in offsets],
+                "ple_head_vocab_sizes": [int(value) for value in vocab_sizes],
+                "ple_vocab_size": ple_vocab_size,
+                "eos_token_id": _required(metadata, f"{prefix}.ple.eos_token_id"),
+            }
+        )
+    return config
+
+
+def _validate_qwen4_exp_file(metadata, config, tensor_names):
+    split_count = int(metadata.get("split.count", 0))
+    split_no = int(metadata.get("split.no", 0))
+    declared_tensors = metadata.get("split.tensors.count")
+    if split_count not in (0, 1) or split_no != 0:
+        raise ValueError("Qwen4-Exp GGUF loading requires one consolidated file")
+    if declared_tensors is not None and int(declared_tensors) != len(tensor_names):
+        raise ValueError("Qwen4-Exp GGUF split.tensors.count does not match the tensor inventory")
+
+    unsupported = sorted(
+        name
+        for name in tensor_names
+        if (
+            name.startswith(("vision.", "mm.", "mtp.", "nextn."))
+            or ".vision." in name
+            or ".mtp." in name
+            or name.startswith(f"blk.{config['num_hidden_layers']}.")
+        )
+    )
+    if unsupported:
+        raise ValueError(f"Qwen4-Exp GGUF contains unsupported vision or MTP tensors: {unsupported[:8]}")
+
+
+def _validate_qwen4_exp_tensor_inventory(config, tensor_names):
+    names = set(tensor_names)
+    # Qwen4-Exp has no final output_norm: its final hyper-connection mixer performs the output norm.
+    required = {"token_embd.weight", "output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight"}
+    if not config["tie_word_embeddings"]:
+        required.add("output.weight")
+    ple_layers = {int(layer) - 1 for layer in config.get("ple_layer_ids", [])}
+    for layer_idx, layer_type in enumerate(config["layer_types"]):
+        prefix = f"blk.{layer_idx}."
+        required.update(
+            prefix + suffix
+            for suffix in (
+                "hc_attn_norm.weight",
+                "hc_attn_down.weight",
+                "hc_attn_up.weight",
+                "hc_attn_inject.weight",
+                "hc_ffn_norm.weight",
+                "hc_ffn_down.weight",
+                "hc_ffn_up.weight",
+                "hc_ffn_inject.weight",
+                "ffn_gate_inp.weight",
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+                "ffn_gate_inp_shexp.weight",
+                "ffn_gate_shexp.weight",
+                "ffn_up_shexp.weight",
+                "ffn_down_shexp.weight",
+            )
+        )
+        if layer_type == "linear_attention":
+            required.update(
+                prefix + suffix
+                for suffix in (
+                    "attn_gate.weight",
+                    "attn_qkv.weight",
+                    "ssm_a",
+                    "ssm_alpha.weight",
+                    "ssm_beta.weight",
+                    "ssm_conv1d.weight",
+                    "ssm_dt.bias",
+                    "ssm_norm.weight",
+                    "ssm_out.weight",
+                )
+            )
+        else:
+            required.update(
+                prefix + suffix
+                for suffix in (
+                    "attn_q.weight",
+                    "attn_q_norm.weight",
+                    "attn_k.weight",
+                    "attn_k_norm.weight",
+                    "attn_v.weight",
+                    "attn_output.weight",
+                    "indexer.q_proj.weight",
+                    "indexer.k_proj.weight",
+                    "indexer.q_norm.weight",
+                    "indexer.k_norm.weight",
+                )
+            )
+        if layer_idx in ple_layers:
+            required.update(
+                prefix + suffix
+                for suffix in (
+                    "ple_key.weight",
+                    "ple_value.weight",
+                    "ple_norm_key.weight",
+                    "ple_norm_query.weight",
+                    "ple_norm_conv.weight",
+                    "ple_conv1d.weight",
+                )
+            )
+    if ple_layers:
+        required.add("per_layer_token_embd.weight")
+    missing = sorted(required - names)
+    if missing:
+        raise ValueError(f"Qwen4-Exp GGUF is missing required tensors: {missing[:12]}")
+
+
 GGUF_CONFIG_ARCHS = {
     "qwen3": _qwen3_config,
     "qwen3moe": _qwen3_moe_config,
     "qwen35": _qwen35_config,
     "qwen35moe": _qwen35_moe_config,
     "deepseek4": _deepseek_v4_config,
+    "qwen4exp": _qwen4_exp_config,
 }
 
+_GGUF_CONFIG_SUPPORTS_TENSOR_SHAPES = {"qwen4exp"}
 
-def get_gguf_config(metadata: dict, tensor_names: tuple[str, ...]) -> dict:
+
+def get_gguf_config(
+    metadata: dict, tensor_names: tuple[str, ...], tensor_shapes: dict[str, tuple[int, ...]] | None = None
+) -> dict:
     """The transformers config dict for a file with this metadata and these tensors.
 
     Raises for an architecture with no entry above; callers with a fallback check `GGUF_CONFIG_ARCHS`.
@@ -344,4 +542,12 @@ def get_gguf_config(metadata: dict, tensor_names: tuple[str, ...]) -> dict:
             f"Cannot rebuild a config from a GGUF file of architecture {architecture!r}. "
             f"Supported: {sorted(GGUF_CONFIG_ARCHS)}."
         )
-    return GGUF_CONFIG_ARCHS[architecture](metadata, tensor_names)
+    config_builder = GGUF_CONFIG_ARCHS[architecture]
+    if architecture in _GGUF_CONFIG_SUPPORTS_TENSOR_SHAPES:
+        config = config_builder(metadata, tensor_names, tensor_shapes)
+    else:
+        config = config_builder(metadata, tensor_names)
+    if architecture == "qwen4exp":
+        _validate_qwen4_exp_file(metadata, config, tensor_names)
+        _validate_qwen4_exp_tensor_inventory(config, tensor_names)
+    return config

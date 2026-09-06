@@ -62,6 +62,14 @@ class Qwen4ExpTextConfig(PreTrainedConfig):
     split_ngram_parts (`int`, *optional*, defaults to 512):
         Number of checkpoint shards used for each PLE n-gram embedding table. Loading concatenates the shards into a
         single runtime embedding, while `save_pretrained` restores the configured sharded layout.
+    ple_head_vocab_sizes (`list[int]`, *optional*):
+        Exact vocabulary size of each hashed PLE head, in the order used by the checkpoint.
+    ple_head_offsets (`list[int]`, *optional*):
+        Starting row offset of each hashed PLE head in the combined embedding table.
+    ple_layer_multipliers (`list[int]`, *optional*):
+        Exact integer multipliers used to hash each PLE n-gram position.
+    ple_vocab_size (`int`, *optional*):
+        Padded row count of the combined PLE embedding table.
     indexer_n_heads (`int`, *optional*):
         Number of query heads used by the QSA token indexer. Setting this enables QSA on full-attention layers.
     indexer_kv_heads (`int`, *optional*):
@@ -155,6 +163,13 @@ class Qwen4ExpTextConfig(PreTrainedConfig):
     make_ngram_vocab_size_divisible_by: int = 128
     seed: int = 1234
     split_ngram_parts: int = 512
+    # These fields are populated from the exact GGUF PLE metadata when present. They keep
+    # the runtime table and integer hash constants independent of the source checkpoint's
+    # sharding and prime-generation defaults.
+    ple_head_vocab_sizes: list[int] | None = None
+    ple_head_offsets: list[int] | None = None
+    ple_layer_multipliers: list[int] | None = None
+    ple_vocab_size: int | None = None
     indexer_n_heads: int | None = None
     indexer_kv_heads: int | None = None
     indexer_head_dim: int | None = None

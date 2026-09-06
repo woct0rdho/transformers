@@ -196,6 +196,23 @@ class Qwen4ExpTextModelTest(CausalLMModelTest, unittest.TestCase):
                 layer_types=["linear_attention", "qwen_sparse_attention"],
             )
 
+    def test_ple_uses_configured_metadata(self):
+        config = self.model_tester.get_config()
+        config.ple_head_vocab_sizes = [29, 31, 37, 41]
+        config.ple_head_offsets = [0, 29, 60, 97]
+        config.ple_layer_multipliers = [3, 5, 7]
+        config.ple_vocab_size = 208
+        with torch.device("meta"):
+            model = Qwen4ExpTextModel(config)
+        model.to_empty(device="cpu")
+        embedding = model.layers[0].ple.ple_embedding
+        model._init_weights(embedding)
+
+        self.assertEqual(embedding.head_vocab_sizes, config.ple_head_vocab_sizes)
+        self.assertEqual(embedding.head_offsets, config.ple_head_offsets)
+        self.assertEqual(embedding.layer_multipliers.tolist(), config.ple_layer_multipliers)
+        self.assertEqual(embedding.ngram_embedding.num_embeddings, config.ple_vocab_size)
+
     def test_finegrained_fp8_embedding_conversion(self):
         config = self.model_tester.get_config()
         with torch.device("meta"):
