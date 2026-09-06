@@ -64,6 +64,46 @@ class GgufConversionOpsTests(unittest.TestCase):
                 name, _ = rule.rename_source_key(name)
             self.assertEqual(name, expected)
 
+    def test_qwen3_moe_shared_expert_gate_mapping_restores_linear_weight_shape(self):
+        rules = GGUF_ARCHS["qwen3moe"](None)
+        converters = [rule for rule in rules if isinstance(rule, WeightConverter)]
+        converter = next(rule for rule in converters if "ffn_gate_inp_shexp" in rule.source_patterns[0])
+        source = torch.zeros(32)
+        result = converter.operations[0].convert({"gate": source}, ["gate"], ["shared_expert_gate.weight"])
+        self.assertEqual(tuple(result["shared_expert_gate.weight"].shape), (1, 32))
+
+    def test_standard_decoder_mapping_covers_qwen3_moe_experts(self):
+        rules = GGUF_ARCHS["qwen3moe"](None)
+        renamings = [rule for rule in rules if isinstance(rule, WeightRenaming)]
+        for source, expected in (
+            ("blk.0.attn_q.weight", "model.layers.0.self_attn.q_proj.weight"),
+            ("blk.0.ffn_gate_inp.weight", "model.layers.0.mlp.gate.weight"),
+            ("blk.0.ffn_down_exps.weight", "model.layers.0.mlp.experts.down_proj"),
+        ):
+            name = source
+            for rule in renamings:
+                name, _ = rule.rename_source_key(name)
+            self.assertEqual(name, expected)
+
+    def test_gguf_plan_uses_converter_target_names(self):
+        from transformers.integrations.gguf.reader import GgufHeader, TensorInfo
+        from transformers.integrations.gguf.utils import get_gguf_plan
+
+        header = GgufHeader(
+            "synthetic.gguf",
+            "qwen3moe",
+            (
+                TensorInfo("blk.0.ffn_gate_exps.weight", (2, 32), GGML_Q8_0, 0, 68),
+                TensorInfo("blk.0.ffn_up_exps.weight", (2, 32), GGML_Q8_0, 68, 68),
+            ),
+            0,
+        )
+        quantized, packable, _, names = get_gguf_plan(header, GGUF_ARCHS["qwen3moe"](None))
+        expected = "model.layers.0.mlp.experts.gate_up_proj"
+        self.assertEqual(set(quantized), {expected})
+        self.assertEqual(packable, {})
+        self.assertEqual(names, [expected, expected])
+
     def test_packed_row_permutation_preserves_metadata(self):
         packed = GgufQuantizedParameter(torch.zeros(2, 34, dtype=torch.uint8), GGML_Q8_0, (2, 32))
         result = PermuteRows(torch.tensor([1, 0])).convert({"weight": packed}, ["weight"], ["weight"])["weight"]

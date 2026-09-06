@@ -171,6 +171,41 @@ def _qwen35(config) -> list[WeightTransform]:
     return renamings + offset_norms + per_value_head + value_reorder
 
 
+def _standard_decoder(config, moe=False):
+    """Mapping shared by Qwen3 and Qwen3-MoE."""
+    renamings = list(DENSE_DECODER_RENAMINGS)
+    renamings.extend(
+        [
+            WeightRenaming(r"^output_norm\.weight", "model.norm.weight"),
+            WeightRenaming(r"\.attn_norm\.", ".input_layernorm."),
+            WeightRenaming(r"\.attn_(q|k)_norm\.", r".self_attn.\1_norm."),
+            WeightRenaming(r"\.ffn_norm\.", ".post_attention_layernorm."),
+            WeightRenaming(r"\.attn_(q|k|v)\.bias", r".self_attn.\1_proj.bias"),
+        ]
+    )
+    if moe:
+        renamings.extend(
+            [
+                WeightRenaming(r"\.ffn_gate_inp\.", ".mlp.gate."),
+                WeightRenaming(r"\.ffn_down_exps\.weight", ".mlp.experts.down_proj"),
+                WeightConverter(
+                    source_patterns=r"\.ffn_gate_inp_shexp\.weight",
+                    target_patterns=".mlp.shared_expert_gate.weight",
+                    operations=[Unsqueeze(0)],
+                ),
+                WeightRenaming(r"\.ffn_(gate|up|down)_shexp\.weight", r".mlp.shared_expert.\1_proj.weight"),
+            ]
+        )
+        renamings.append(
+            WeightConverter(
+                source_patterns=[r"\.ffn_gate_exps\.weight", r"\.ffn_up_exps\.weight"],
+                target_patterns=".mlp.experts.gate_up_proj",
+                operations=[Concatenate(dim=1)],
+            )
+        )
+    return renamings
+
+
 class Concatenate(ConversionOps):
     """Concatenate the tensors collected from a one-to-many source conversion."""
 
@@ -208,6 +243,8 @@ def _qwen35_moe(config):
 
 # gguf `general.architecture` -> builder taking the model config
 GGUF_ARCHS = {
+    "qwen3": lambda config: _standard_decoder(config),
+    "qwen3moe": lambda config: _standard_decoder(config, moe=True),
     "qwen35": _qwen35,
     "qwen35moe": _qwen35_moe,
 }
