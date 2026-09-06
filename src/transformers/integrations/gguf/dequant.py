@@ -62,17 +62,17 @@ def _interleave_nibbles(qs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _dequant_q8_0(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    d = _half(blocks, 0).to(dtype)
-    qs = blocks[:, 2:34].contiguous().view(torch.int8).to(dtype)
-    return d * qs
+    d = _half(blocks, 0)
+    qs = blocks[:, 2:34].contiguous().view(torch.int8).to(torch.float32)
+    return (d * qs).to(dtype)
 
 
 def _dequant_q4_k(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     d, dmin = _half(blocks, 0), _half(blocks, 2)
     scale, minimum = _k_scales(blocks[:, 4:16])
     low, high = _interleave_nibbles(blocks[:, 16:144])
-    q = torch.stack([low, high], dim=2).reshape(-1, 8, 32).to(dtype)
-    return (d * scale).to(dtype)[..., None] * q - (dmin * minimum).to(dtype)[..., None]
+    q = torch.stack([low, high], dim=2).reshape(-1, 8, 32).to(torch.float32)
+    return ((d * scale)[..., None] * q - (dmin * minimum)[..., None]).to(dtype)
 
 
 def _dequant_q5_k(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -83,8 +83,8 @@ def _dequant_q5_k(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     shift = torch.arange(4, device=blocks.device, dtype=torch.uint8).reshape(1, 4, 1) * 2
     low = low + ((qh >> shift) & 1) * 16
     high = high + ((qh >> (shift + 1)) & 1) * 16
-    q = torch.stack([low, high], dim=2).reshape(-1, 8, 32).to(dtype)
-    return (d * scale).to(dtype)[..., None] * q - (dmin * minimum).to(dtype)[..., None]
+    q = torch.stack([low, high], dim=2).reshape(-1, 8, 32).to(torch.float32)
+    return ((d * scale)[..., None] * q - (dmin * minimum)[..., None]).to(dtype)
 
 
 def _dequant_q6_k(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -104,9 +104,9 @@ def _dequant_q6_k(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
             (hi >> 4) | (((h >> 6) & 3) << 4),
         ]
         for quarter, q in enumerate(quants):
-            scale = (d * sc[:, which + 2 * quarter]).to(dtype)
-            out.append(scale * (q.to(dtype) - 32))
-    return torch.cat(out, dim=1)
+            scale = d * sc[:, which + 2 * quarter]
+            out.append(scale * (q.to(torch.float32) - 32))
+    return torch.cat(out, dim=1).to(dtype)
 
 
 _DEQUANT = {
