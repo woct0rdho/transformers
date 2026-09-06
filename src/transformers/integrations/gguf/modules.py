@@ -156,6 +156,82 @@ class GgufLinear(_ComputeDtypeMixin, nn.Linear):
         return self._permute_segment(output, self.output_permutation, self.output_permutation_offset, "output")
 
 
+class _GgufGroupedLinearFunction(torch.autograd.Function):
+    """Recompute a packed grouped weight for activation gradients."""
+
+    @staticmethod
+    def forward(ctx, input, weight, compute_dtype, n_groups):
+        ctx.quant_type = weight.quant_type
+        ctx.logical_shape = weight.logical_shape
+        ctx.compute_dtype = compute_dtype
+        ctx.input_dtype = input.dtype
+        ctx.input_shape = tuple(input.shape)
+        ctx.n_groups = n_groups
+        if ctx.needs_input_grad[0]:
+            ctx.save_for_backward(weight.as_subclass(torch.Tensor))
+        dense_weight = weight.dequantize(dtype=compute_dtype, device=input.device)
+        grouped_weight = dense_weight.view(n_groups, -1, dense_weight.shape[-1])
+        flat_input = input.to(compute_dtype).reshape(-1, n_groups, input.shape[-1]).transpose(0, 1)
+        output = torch.bmm(flat_input, grouped_weight.transpose(1, 2)).transpose(0, 1)
+        return output.reshape(*input.shape[:-2], n_groups, -1).to(input.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = None
+        if ctx.needs_input_grad[0]:
+            (payload,) = ctx.saved_tensors
+            packed = GgufQuantizedParameter(payload, ctx.quant_type, ctx.logical_shape)
+            dense_weight = packed.dequantize(dtype=ctx.compute_dtype, device=grad_output.device)
+            grouped_weight = dense_weight.view(ctx.n_groups, -1, dense_weight.shape[-1])
+            flat_grad = (
+                grad_output.to(ctx.compute_dtype).reshape(-1, ctx.n_groups, grad_output.shape[-1]).transpose(0, 1)
+            )
+            grad_input = (
+                torch.bmm(flat_grad, grouped_weight).transpose(0, 1).reshape(ctx.input_shape).to(ctx.input_dtype)
+            )
+        return grad_input, None, None, None
+
+
+class GgufGroupedLinear(GgufLinear):
+    """Packed block-diagonal linear layer."""
+
+    def __init__(self, in_features, out_features, n_groups, **kwargs):
+        if not isinstance(n_groups, int) or n_groups <= 0 or out_features % n_groups:
+            raise ValueError("GGUF grouped linear requires a positive group count dividing out_features")
+        super().__init__(in_features, out_features, bias=False, **kwargs)
+        self.n_groups = n_groups
+
+    @classmethod
+    def from_grouped_linear(cls, module, **kwargs):
+        if module.bias is not None:
+            raise ValueError("GGUF grouped linear replacement does not support bias")
+        return cls(
+            module.in_features,
+            module.out_features,
+            module.n_groups,
+            device=module.weight.device,
+            dtype=module.weight.dtype,
+            **kwargs,
+        )
+
+    def forward(self, input):
+        if isinstance(self.weight, GgufQuantizedParameter):
+            if torch.is_grad_enabled() and input.requires_grad:
+                return _GgufGroupedLinearFunction.apply(input, self.weight, self.compute_dtype, self.n_groups)
+            weight = self.weight.dequantize(dtype=self.compute_dtype, device=input.device)
+            compute_input = input.to(self.compute_dtype)
+        elif self.weight.is_floating_point():
+            weight = self.weight.to(dtype=self.compute_dtype)
+            compute_input = input
+        else:
+            raise RuntimeError("GgufGroupedLinear weight has not been loaded")
+        input_shape = compute_input.shape[:-2]
+        grouped_weight = weight.view(self.n_groups, -1, weight.shape[-1])
+        flat_input = compute_input.reshape(-1, self.n_groups, compute_input.shape[-1]).transpose(0, 1)
+        output = torch.bmm(flat_input, grouped_weight.transpose(1, 2)).transpose(0, 1)
+        return output.reshape(*input_shape, self.n_groups, -1).to(input.dtype)
+
+
 class GgufEmbedding(_ComputeDtypeMixin, nn.Embedding):
     """Embedding layer backed by row-selective GGUF dequantization."""
 
