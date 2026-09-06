@@ -299,6 +299,37 @@ class GgufEmbedding(_ComputeDtypeMixin, nn.Embedding):
         raise RuntimeError("GgufEmbedding weight has not been loaded")
 
 
+class GgufQwen4ExpIndexerLinear(nn.Module):
+    """Persistent Qwen4-Exp indexer projection backed by Q and K payloads."""
+
+    def __init__(self, in_features, q_out_features, k_out_features, **kwargs):
+        super().__init__()
+        kwargs.pop("bias", None)
+        self.q_proj = GgufLinear(in_features, q_out_features, bias=False, **kwargs)
+        self.k_proj = GgufLinear(in_features, k_out_features, bias=False, **kwargs)
+
+    @classmethod
+    def from_linear(cls, module, q_out_features, k_out_features, **kwargs):
+        if module.bias is not None or module.out_features != q_out_features + k_out_features:
+            raise ValueError("Qwen4-Exp indexer projection must be bias-free with matching Q and K output sizes")
+        return cls(
+            module.in_features,
+            q_out_features,
+            k_out_features,
+            device=module.weight.device,
+            dtype=module.weight.dtype,
+            **kwargs,
+        )
+
+    def forward(self, input):
+        return torch.cat((self.q_proj(input), self.k_proj(input)), dim=-1)
+
+    def materialize_logical_weight(self, **kwargs):
+        return torch.cat(
+            (self.q_proj.materialize_logical_weight(**kwargs), self.k_proj.materialize_logical_weight(**kwargs)), dim=0
+        )
+
+
 def _is_expert_candidate(name, module):
     is_experts_name = name == "experts" or name.endswith(".experts")
     has_provider = callable(getattr(module, "_get_expert_projection_tensors", None))
@@ -333,7 +364,7 @@ def replace_with_gguf_modules(model, compute_dtype=None, floating_checkpoint_par
 
     replacements = {}
     for name, module in modules:
-        if not name or isinstance(module, (GgufLinear, GgufEmbedding, GgufGroupedLinear)):
+        if not name or isinstance(module, (GgufLinear, GgufEmbedding, GgufGroupedLinear, GgufQwen4ExpIndexerLinear)):
             continue
         parameter_name = f"{name}.weight"
         if _is_expert_candidate(name, module):
@@ -345,6 +376,21 @@ def replace_with_gguf_modules(model, compute_dtype=None, floating_checkpoint_par
             if selective and not expert_names & (packed_parameter_names | floating_checkpoint_params):
                 continue
             replacement = experts_class.from_module(module, compute_dtype=compute_dtype)
+        elif model_type == "qwen4_exp_text" and name.endswith(".index_qk_proj") and isinstance(module, nn.Linear):
+            if selective and not any(
+                f"{name}.{part}.weight" in packed_parameter_names | floating_checkpoint_params
+                for part in ("q_proj", "k_proj")
+            ):
+                continue
+            replacement = GgufQwen4ExpIndexerLinear.from_linear(
+                module,
+                q_out_features=text_config.indexer_n_heads * text_config.indexer_head_dim,
+                k_out_features=text_config.indexer_kv_heads * text_config.indexer_head_dim,
+                compute_dtype=compute_dtype,
+                floating_weight=all(
+                    f"{name}.{part}.weight" in floating_checkpoint_params for part in ("q_proj", "k_proj")
+                ),
+            )
         elif isinstance(module, nn.Linear) and hasattr(module, "n_groups"):
             if (
                 selective
@@ -383,6 +429,9 @@ def replace_with_gguf_modules(model, compute_dtype=None, floating_checkpoint_par
         if _is_expert_candidate(name, module):
             for projection in ("gate_proj", "up_proj", "down_proj"):
                 replacements[f"{name}.{projection}"] = replacement
+        elif isinstance(replacement, GgufQwen4ExpIndexerLinear):
+            replacements[f"{name}.q_proj"] = replacement.q_proj
+            replacements[f"{name}.k_proj"] = replacement.k_proj
         else:
             replacements[parameter_name] = replacement
     return replacements
