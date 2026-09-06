@@ -340,3 +340,16 @@ class GgufExperts(nn.Module):
     @property
     def weight_state(self):
         return _validate_expert_weights(self)
+
+
+class DeepseekV4GgufExperts(GgufExperts):
+    """DeepSeek V4 packed experts with clamped split SwiGLU gating."""
+
+    _supported_source_gate_implementations = frozenset({"custom"})
+
+    def __init__(self, config, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+        self.limit = config.swiglu_limit
+
+    def _apply_split_gate(self, gate, up):
+        return self.act_fn(gate.clamp(max=self.limit)) * up.clamp(min=-self.limit, max=self.limit)
