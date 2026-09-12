@@ -91,7 +91,11 @@ def get_unconverted_keys(mapping: list[WeightTransform], header: GgufHeader) -> 
 
 
 def add_gguf_load_ops(
-    mapping: list[WeightTransform], needs_unpacking: dict[str, int], header: GgufHeader, dtype
+    mapping: list[WeightTransform],
+    needs_unpacking: dict[str, int],
+    header: GgufHeader,
+    dtype,
+    keep_fp32: tuple[str, ...] = (),
 ) -> list:
     """Give every tensor the two ops it needs: unpack its blocks first, cast to `dtype` last.
 
@@ -101,7 +105,7 @@ def add_gguf_load_ops(
     unconverted = get_unconverted_keys(mapping, header)
     converters = [entry for entry in mapping if isinstance(entry, WeightConverter)]
     dequantize_op = Dequantize(needs_unpacking, dtype) if needs_unpacking else None
-    cast_op = Cast(dtype)
+    cast_op = Cast(dtype, keep_fp32=keep_fp32)
     for converter in converters:
         if dequantize_op is not None:
             converter.operations.insert(0, dequantize_op)
