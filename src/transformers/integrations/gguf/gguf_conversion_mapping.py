@@ -25,6 +25,7 @@ from ...core_model_loading import (
     WeightConverter,
     WeightRenaming,
     WeightTransform,
+    build_glob_alternation,
 )
 from .gguf_quantized_parameter import GgufQuantizedParameter
 
@@ -461,10 +462,26 @@ class Cast(ConversionOps):
     pass through untouched.
 
     Example: `[0.02] f32 -> [0.02] bf16`
+
+    `keep_fp32` carries the name patterns a model declares FP32-strict through
+    `PreTrainedModel._keep_in_fp32_modules[ _strict]`. Those tensors are cast to FP32 instead of the load
+    dtype, because a value rounded to the load dtype here cannot be recovered by whatever consumes it
+    later; the safetensors path already keeps them in FP32 through `PreTrainedModel._get_dtype_plan`, and
+    the two loaders have to agree on resident dtypes for the same model. Patterns are matched like the
+    dtype plan is (regex search, `*` acting as a wildcard).
+
+    A tensor that already carries the load dtype passes through before the pattern test: it either is a
+    floating tensor the file stores at that width, or one `Dequantize` produced, which has already spent
+    the extra precision. Forcing FP32 storage on it would change dtypes without restoring anything.
+
+    Integer and boolean tensors are not a floating computation and have no load dtype, so they keep the
+    dtype the file stores (`tid2eid` routing tables stay integer state).
     """
 
-    def __init__(self, dtype: "torch.dtype"):
+    def __init__(self, dtype: "torch.dtype", keep_fp32: tuple[str, ...] = ()):
         self.dtype = dtype
+        self.keep_fp32 = tuple(keep_fp32)
+        self.keep_fp32_alternation = build_glob_alternation(list(self.keep_fp32))[0] if self.keep_fp32 else None
 
     @torch.no_grad
     def convert(
@@ -479,6 +496,10 @@ class Cast(ConversionOps):
         name = full_layer_name if full_layer_name is not None else target_patterns[0]
         if tensor.dtype in (torch.uint8, self.dtype):
             return {name: tensor}
+        if not tensor.is_floating_point():
+            return {name: tensor}
+        if self.keep_fp32_alternation is not None and self.keep_fp32_alternation.search(name):
+            return {name: tensor.to(torch.float32)}
         return {name: tensor.to(self.dtype)}
 
 
