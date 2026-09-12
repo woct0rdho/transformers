@@ -11,11 +11,14 @@ from transformers.core_model_loading import WeightConverter, WeightRenaming
 from transformers.integrations.gguf.dequant import GGML_Q8_0
 from transformers.integrations.gguf.gguf_conversion_mapping import (
     GGUF_ARCHS,
+    Cast,
     Concatenate,
     PermuteInputFeatures,
     PermuteRows,
 )
 from transformers.integrations.gguf.gguf_quantized_parameter import GgufQuantizedParameter
+from transformers.integrations.gguf.utils import add_gguf_load_ops
+from transformers.modeling_utils import PreTrainedModel
 
 
 class GgufConversionOpsTests(unittest.TestCase):
@@ -143,6 +146,90 @@ class GgufConversionOpsTests(unittest.TestCase):
             "weight"
         ]
         self.assertIs(result, packed)
+
+    def test_cast_keeps_fp32_strict_values_and_casts_everything_else(self):
+        # `8.9697` and `9.0261` are not representable in bf16: the checkpoint stores values that are
+        # finer than one bf16 step, which is exactly what the FP32-strict declaration protects.
+        source = torch.tensor([8.9697, 9.0261], dtype=torch.float32)
+        cast = Cast(torch.bfloat16, keep_fp32=("e_score_correction_bias", "norm"))
+
+        kept = cast.convert(
+            {"bias": source},
+            ["bias"],
+            ["bias"],
+            full_layer_name="model.layers.0.mlp.gate.e_score_correction_bias",
+        )
+        bias = kept["model.layers.0.mlp.gate.e_score_correction_bias"]
+        self.assertEqual(bias.dtype, torch.float32)
+        torch.testing.assert_close(bias, source, rtol=0, atol=0)
+
+        # A half-precision source keeps all of its mantissa rather than losing bits to the load dtype.
+        half = torch.tensor([1.0009765625], dtype=torch.float16)
+        kept = cast.convert(
+            {"weight": half}, ["weight"], ["weight"], full_layer_name="model.layers.0.input_layernorm.weight"
+        )
+        normalized = kept["model.layers.0.input_layernorm.weight"]
+        self.assertEqual(normalized.dtype, torch.float32)
+        self.assertEqual(float(normalized), float(half))
+
+        # Unmatched floating tensors, packed payloads, and tensors that already carry the load dtype
+        # (what `Dequantize` produces) are untouched by the policy.
+        unchanged = cast.convert(
+            {"weight": source}, ["weight"], ["weight"], full_layer_name="model.layers.0.self_attn.o_proj.weight"
+        )
+        self.assertEqual(unchanged["model.layers.0.self_attn.o_proj.weight"].dtype, torch.bfloat16)
+        packed = GgufQuantizedParameter(torch.zeros(2, 34, dtype=torch.uint8), GGML_Q8_0, (2, 32))
+        self.assertIs(
+            cast.convert({"weight": packed}, ["weight"], ["weight"], full_layer_name="model.layers.0.norm.weight")[
+                "model.layers.0.norm.weight"
+            ],
+            packed,
+        )
+        already_cast = source.to(torch.bfloat16)
+        result = cast.convert(
+            {"bias": already_cast},
+            ["bias"],
+            ["bias"],
+            full_layer_name="model.layers.0.mlp.gate.e_score_correction_bias",
+        )
+        self.assertEqual(result["model.layers.0.mlp.gate.e_score_correction_bias"].dtype, torch.bfloat16)
+
+    def test_cast_leaves_integer_state_alone(self):
+        # `tid2eid` is integer routing state (the model declares a long buffer); an id table has no
+        # floating load dtype and must not be rounded into one.
+        table = torch.tensor([[0, 255], [17, 3]], dtype=torch.int32)
+        result = Cast(torch.bfloat16, keep_fp32=("norm",)).convert(
+            {"ids": table}, ["ids"], ["ids"], full_layer_name="model.layers.0.mlp.gate.tid2eid"
+        )
+        self.assertEqual(result["model.layers.0.mlp.gate.tid2eid"].dtype, torch.int32)
+        torch.testing.assert_close(result["model.layers.0.mlp.gate.tid2eid"], table, rtol=0, atol=0)
+
+    def test_deepseek_v4_router_bias_survives_the_load_chain(self):
+        from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4PreTrainedModel
+
+        # The plan the safetensors path would use for the same model and dtype.
+        dtype_plan = PreTrainedModel._get_dtype_plan(DeepseekV4PreTrainedModel, torch.bfloat16)
+        self.assertIn("e_score_correction_bias", dtype_plan)
+        self.assertEqual(dtype_plan["e_score_correction_bias"], torch.float32)
+
+        name = "model.layers.10.mlp.gate.e_score_correction_bias"
+        source = torch.tensor([8.9697, 9.0261], dtype=torch.float32)
+
+        def run(keep_fp32):
+            mapping = add_gguf_load_ops(GGUF_ARCHS["deepseek4"](None), {}, [name], torch.bfloat16, keep_fp32=keep_fp32)
+            converter = next(
+                rule for rule in mapping if isinstance(rule, WeightConverter) and rule.rename_source_key(name)[1]
+            )
+            tensors = {"bias": source}
+            for op in converter.operations:
+                tensors = op.convert(tensors, ["bias"], ["bias"], full_layer_name=name)
+            return tensors[name]
+
+        loaded = run(tuple(dtype_plan))
+        self.assertEqual(loaded.dtype, torch.float32)
+        torch.testing.assert_close(loaded, source, rtol=0, atol=0)
+        # Without the model's plan the same chain silently rounds the value into bf16.
+        self.assertEqual(run(()).dtype, torch.bfloat16)
 
 
 if __name__ == "__main__":

@@ -78,11 +78,22 @@ def get_gguf_plan(
     return quantized, packable, permutations, names
 
 
-def add_gguf_load_ops(mapping: list[WeightTransform], to_unpack: dict[str, int], names: list[str], dtype) -> list:
-    """Bracket every conversion chain: unpack blocks first where needed, cast to `dtype` last."""
+def add_gguf_load_ops(
+    mapping: list[WeightTransform],
+    to_unpack: dict[str, int],
+    names: list[str],
+    dtype,
+    keep_fp32: tuple[str, ...] = (),
+) -> list:
+    """Bracket every conversion chain: unpack blocks first where needed, cast to `dtype` last.
+
+    `keep_fp32` is forwarded to `Cast`: it carries the name patterns the model declares FP32-strict, which
+    stay FP32 instead of taking the load dtype, so a GGUF load agrees with a safetensors load of the same
+    model. See `Cast`.
+    """
     converters = [entry for entry in mapping if isinstance(entry, WeightConverter)]
     dequantize_op = Dequantize(to_unpack, dtype) if to_unpack else None
-    cast_op = Cast(dtype)
+    cast_op = Cast(dtype, keep_fp32=keep_fp32)
     for converter in converters:
         if dequantize_op is not None:
             converter.operations.insert(0, dequantize_op)

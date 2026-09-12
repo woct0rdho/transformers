@@ -74,6 +74,8 @@ class GgufHfQuantizer(HfQuantizer):
         self.header = None
         self.kernel = None
         self.dtype = None
+        # Name patterns the model declares FP32-strict, resolved once the model exists.
+        self.keep_fp32 = ()
         # TODO: only for the legacy loader — drop this, and every hook that guards on it, once all
         # architectures go through this path and there is no fallback left
         self.supported = False
@@ -160,6 +162,14 @@ class GgufHfQuantizer(HfQuantizer):
             mapping = _persistent_conversion_mapping(mapping)
         self.mapping = mapping
         self.quantized, packable, self.input_permutations, self.names = get_gguf_plan(self.header, self.mapping)
+        # Which resident dtypes the model requires is the model's decision, not the adapter's. The
+        # safetensors path applies the same plan through `PreTrainedModel._get_dtype_plan`; asking for it
+        # here keeps the two loaders of one model consistent. It matters because the final cast of the
+        # conversion chain is the last chance to keep a value: a tensor rounded to the load dtype cannot
+        # be recovered by the operation that consumes it.
+        dtype_plan = getattr(model, "_get_dtype_plan", None)
+        if callable(dtype_plan) and self.dtype is not None:
+            self.keep_fp32 = tuple(dtype_plan(self.dtype))
         if self.quantization_config.dequantize:
             return model
         floating = set(self.names) - set(self.quantized)
@@ -223,7 +233,13 @@ class GgufHfQuantizer(HfQuantizer):
             return weight_conversions
         packed_params = set(self.packed_modules)
         to_unpack = {name: t for name, t in self.quantized.items() if name not in packed_params}
-        return add_gguf_load_ops(self.mapping + weight_conversions, to_unpack, self.names, self.dtype)
+        return add_gguf_load_ops(
+            self.mapping + weight_conversions,
+            to_unpack,
+            self.names,
+            self.dtype,
+            keep_fp32=self.keep_fp32,
+        )
 
     def param_element_size(self, model, param_name: str, param: "torch.Tensor") -> float:
         """Report packed bytes per logical element for parameters retained in GGUF blocks."""

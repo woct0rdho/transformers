@@ -11,6 +11,7 @@ import torch
 from transformers.core_model_loading import WeightConverter, WeightRenaming
 from transformers.integrations.gguf.dequant import GGML_BLOCK, GGML_Q4_K
 from transformers.integrations.gguf.gguf_conversion_mapping import Concatenate
+from transformers.modeling_utils import PreTrainedModel
 from transformers.quantizers.quantizer_gguf import GgufHfQuantizer, _persistent_conversion_mapping
 from transformers.utils.quantization_config import GgufConfig
 
@@ -118,6 +119,63 @@ class GgufLoaderTests(unittest.TestCase):
         self.assertIn(".mlp.experts.gate_proj", targets)
         self.assertIn(".mlp.experts.up_proj", targets)
         self.assertNotIn(".mlp.experts.gate_up_proj", targets)
+
+    def test_quantizer_resolves_the_model_dtype_plan(self):
+        class _Model:
+            config = SimpleNamespace()
+            _keep_in_fp32_modules = None
+            _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+
+            def _get_dtype_plan(self, dtype):
+                return PreTrainedModel._get_dtype_plan(self, dtype)
+
+        with (
+            patch("transformers.quantizers.quantizer_gguf.get_gguf_conversion_mapping", return_value=[]),
+            patch("transformers.quantizers.quantizer_gguf.get_gguf_plan", return_value=({}, {}, {}, [])),
+        ):
+            quantizer = GgufHfQuantizer(GgufConfig(dequantize=True))
+            quantizer.supported = True
+            quantizer.header = SimpleNamespace(architecture="deepseek4")
+            quantizer.dtype = torch.bfloat16
+            quantizer._process_model_before_weight_loading(_Model())
+        self.assertEqual(quantizer.keep_fp32, ("e_score_correction_bias",))
+
+    def test_quantizer_forwards_the_dtype_plan_to_the_load_ops(self):
+        name = "model.layers.0.mlp.gate.e_score_correction_bias"
+        quantizer = GgufHfQuantizer(GgufConfig())
+        quantizer.supported = True
+        quantizer.dtype = torch.bfloat16
+        quantizer.mapping = []
+        quantizer.names = [name]
+        quantizer.quantized = {}
+        quantizer.packed_modules = {}
+        quantizer.keep_fp32 = ("e_score_correction_bias",)
+
+        mapping = quantizer.update_weight_conversions([])
+        converter = next(rule for rule in mapping if isinstance(rule, WeightConverter))
+        tensors = {"bias": torch.tensor([8.9697, 9.0261], dtype=torch.float32)}
+        for op in converter.operations:
+            tensors = op.convert(tensors, ["bias"], ["bias"], full_layer_name=name)
+        loaded = tensors[name]
+        self.assertEqual(loaded.dtype, torch.float32)
+        torch.testing.assert_close(loaded, torch.tensor([8.9697, 9.0261]), rtol=0, atol=0)
+
+    def test_quantizer_without_a_dtype_plan_keeps_the_load_dtype(self):
+        name = "model.layers.0.self_attn.o_proj.weight"
+        quantizer = GgufHfQuantizer(GgufConfig())
+        quantizer.supported = True
+        quantizer.dtype = torch.bfloat16
+        quantizer.mapping = []
+        quantizer.names = [name]
+        quantizer.quantized = {}
+        quantizer.packed_modules = {}
+
+        mapping = quantizer.update_weight_conversions([])
+        converter = next(rule for rule in mapping if isinstance(rule, WeightConverter))
+        tensors = {"weight": torch.zeros(2, dtype=torch.float32)}
+        for op in converter.operations:
+            tensors = op.convert(tensors, ["weight"], ["weight"], full_layer_name=name)
+        self.assertEqual(tensors[name].dtype, torch.bfloat16)
 
 
 if __name__ == "__main__":
