@@ -195,34 +195,29 @@ class Concatenate(CoreConcatenate):
         return super().convert(input_dict, source_patterns, target_patterns, **kwargs)
 
 
-def _qwen35moe(config) -> list[WeightTransform]:
-    """Everything outside the FFN is `_qwen35`'s: llama.cpp converts both through the same base class."""
-    routed = [
+def _qwen35_moe(config):
+    return _qwen35(config) + [
         WeightRenaming(r"\.ffn_gate_inp\.", ".mlp.gate."),
         WeightRenaming(r"\.ffn_down_exps\.weight", ".mlp.experts.down_proj"),
-        WeightRenaming(r"\.ffn_gate_inp_shexp\.", ".mlp.shared_expert_gate."),
-        WeightRenaming(r"\.ffn_gate_shexp\.", ".mlp.shared_expert.gate_proj."),
-        WeightRenaming(r"\.ffn_up_shexp\.", ".mlp.shared_expert.up_proj."),
-        WeightRenaming(r"\.ffn_down_shexp\.", ".mlp.shared_expert.down_proj."),
+        WeightConverter(
+            source_patterns=r"\.ffn_gate_inp_shexp\.weight",
+            target_patterns=".mlp.shared_expert_gate.weight",
+            operations=[Unsqueeze(0, expected_ndim=2)],
+        ),
+        WeightRenaming(r"\.ffn_(gate|up|down)_shexp\.weight", r".mlp.shared_expert.\1_proj.weight"),
+        # `gate_up_proj` is chunked in two on dim 1, so gate comes first and up second.
+        WeightConverter(
+            source_patterns=[r"\.ffn_gate_exps\.weight", r"\.ffn_up_exps\.weight"],
+            target_patterns=".mlp.experts.gate_up_proj",
+            operations=[Concatenate(dim=1)],
+        ),
     ]
-    # `gate_up_proj` is chunked in two on dim 1, so gate comes first and up second.
-    fuse_gate_up = WeightConverter(
-        source_patterns=[r"\.ffn_gate_exps\.weight", r"\.ffn_up_exps\.weight"],
-        target_patterns=".mlp.experts.gate_up_proj",
-        operations=[Concatenate(dim=1)],
-    )
-    restore_gate = WeightConverter(
-        source_patterns="mlp.shared_expert_gate.weight",
-        target_patterns="mlp.shared_expert_gate.weight",
-        operations=[Unsqueeze(0, expected_ndim=2)],
-    )
-    return _qwen35(config) + routed + [fuse_gate_up, restore_gate]
 
 
 # gguf `general.architecture` -> builder taking the model config
 GGUF_ARCHS = {
     "qwen35": _qwen35,
-    "qwen35moe": _qwen35moe,
+    "qwen35moe": _qwen35_moe,
 }
 
 
