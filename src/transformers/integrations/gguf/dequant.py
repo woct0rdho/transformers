@@ -28,11 +28,15 @@ GGML_Q4_0, GGML_Q4_1, GGML_Q5_0, GGML_Q5_1, GGML_Q8_0 = 2, 3, 6, 7, 8
 GGML_Q2_K, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K = 10, 11, 12, 13, 14
 GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ3_XXS, GGML_IQ1_S = 16, 17, 18, 19
 GGML_IQ4_NL, GGML_IQ3_S, GGML_IQ2_S, GGML_IQ4_XS, GGML_IQ1_M = 20, 21, 22, 23, 29
+GGML_TQ1_0, GGML_TQ2_0 = 34, 35
+GGML_MXFP4, GGML_NVFP4 = 39, 40
 
 # ggml type id -> (elements per block, bytes per block)
 GGML_BLOCK = {
     GGML_Q4_0: (32, 18),
     GGML_Q4_1: (32, 20),
+    GGML_Q5_0: (32, 22),
+    GGML_Q5_1: (32, 24),
     GGML_Q8_0: (32, 34),
     GGML_Q2_K: (256, 84),
     GGML_Q3_K: (256, 110),
@@ -48,6 +52,10 @@ GGML_BLOCK = {
     GGML_IQ2_S: (256, 82),
     GGML_IQ4_XS: (256, 136),
     GGML_IQ1_M: (256, 56),
+    GGML_TQ1_0: (256, 54),
+    GGML_TQ2_0: (256, 66),
+    GGML_MXFP4: (32, 17),
+    GGML_NVFP4: (64, 36),
 }
 
 
@@ -60,6 +68,8 @@ def row_bytes(ggml_type: int, in_features: int) -> int:
 GGML_NAME = {
     GGML_Q4_0: "Q4_0",
     GGML_Q4_1: "Q4_1",
+    GGML_Q5_0: "Q5_0",
+    GGML_Q5_1: "Q5_1",
     GGML_Q8_0: "Q8_0",
     GGML_Q2_K: "Q2_K",
     GGML_Q3_K: "Q3_K",
@@ -75,10 +85,17 @@ GGML_NAME = {
     GGML_IQ2_S: "IQ2_S",
     GGML_IQ4_XS: "IQ4_XS",
     GGML_IQ1_M: "IQ1_M",
+    GGML_TQ1_0: "TQ1_0",
+    GGML_TQ2_0: "TQ2_0",
+    GGML_MXFP4: "MXFP4",
+    GGML_NVFP4: "NVFP4",
 }
 
 # The 16 levels an IQ4 nibble indexes, shared by IQ4_NL and IQ4_XS (ggml's `kvalues_iq4nl`).
 _IQ4_LEVELS = (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113)
+
+# The 16 levels an MXFP4 or NVFP4 nibble indexes (ggml's `kvalues_mxfp4`; both types share it).
+_FP4_LEVELS = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
 
 
 def dequantize(data: torch.Tensor, ggml_type: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
@@ -114,6 +131,12 @@ def _shifted(data: torch.Tensor, shifts: tuple[int, ...], width: int) -> torch.T
 def _iq4_levels(nibbles: torch.Tensor) -> torch.Tensor:
     """Nibbles -> the levels they index, in float32."""
     levels = torch.tensor(_IQ4_LEVELS, device=nibbles.device, dtype=torch.float32)
+    return levels[nibbles.long()]
+
+
+def _fp4_levels(nibbles: torch.Tensor) -> torch.Tensor:
+    """Nibbles -> the levels MXFP4 and NVFP4 index, in float32."""
+    levels = torch.tensor(_FP4_LEVELS, device=nibbles.device, dtype=torch.float32)
     return levels[nibbles.long()]
 
 
@@ -157,6 +180,20 @@ def _dequant_q4_0(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 def _dequant_q4_1(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     nibbles = _shifted(blocks[:, 4:20], (0, 4), 16).reshape(-1, 32) & 0xF
     return (_half(blocks, 0) * nibbles + _half(blocks, 2)).to(dtype)
+
+
+def _dequant_q5_0(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    # the fifth bit of each value is a plane of 32 bits: value `j` takes bit `j`
+    high = _shift_of(_words(blocks[:, 2:6], 4), tuple(range(32))) & 1
+    low = _shifted(blocks[:, 6:22], (0, 4), 16).reshape(-1, 32) & 0xF
+    quants = (low | (high << 4)).to(torch.int8) - 16
+    return (_half(blocks, 0) * quants).to(dtype)
+
+
+def _dequant_q5_1(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    high = _shift_of(_words(blocks[:, 4:8], 4), tuple(range(32))) & 1
+    low = _shifted(blocks[:, 8:24], (0, 4), 16).reshape(-1, 32) & 0xF
+    return (_half(blocks, 0) * (low | (high << 4)) + _half(blocks, 2)).to(dtype)
 
 
 def _dequant_q2_k(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -685,9 +722,61 @@ def _dequant_iq3_s(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return (db * points * sign).reshape(nb, -1).to(dtype)
 
 
+def _dequant_tq1_0(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    nb = blocks.shape[0]
+    # base-3 digits, five per byte: two planes of 32 bytes and one of 4
+    weights5 = torch.tensor((1, 3, 9, 27, 81), device=blocks.device, dtype=torch.int32).reshape(1, 1, 5, 1)
+    weights4 = torch.tensor((1, 3, 9, 27), device=blocks.device, dtype=torch.int32).reshape(1, 1, 4, 1)
+    low = (blocks[:, 0:32].to(torch.int32).reshape(nb, -1, 1, 32) * weights5 & 0xFF).reshape(nb, -1)
+    high = (blocks[:, 32:48].to(torch.int32).reshape(nb, -1, 1, 16) * weights5 & 0xFF).reshape(nb, -1)
+    tail = (blocks[:, 48:52].to(torch.int32).reshape(nb, -1, 1, 4) * weights4 & 0xFF).reshape(nb, -1)
+    quants = ((torch.cat([low, high, tail], dim=-1) * 3) >> 8).to(torch.int8) - 1
+    return (_half(blocks, 52) * quants).to(dtype)
+
+
+def _dequant_tq2_0(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    nb = blocks.shape[0]
+    quants = (_shifted(blocks[:, 0:64], (0, 2, 4, 6), 32) & 3).reshape(nb, -1).to(torch.int8) - 1
+    return (_half(blocks, 64) * quants).to(dtype)
+
+
+def _e8m0_to_fp32_half(x: torch.Tensor) -> torch.Tensor:
+    """An E8M0 exponent byte (MXFP4's scale) -> float32."""
+    x = x.to(torch.int32)
+    bits = torch.where(x < 2, torch.tensor(0x00200000, device=x.device, dtype=torch.int32) << x, (x - 1) << 23)
+    return bits.view(torch.float32)
+
+
+def _dequant_mxfp4(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    nibbles = _shifted(blocks[:, 1:17], (0, 4), 16).reshape(-1, 32) & 0xF
+    return (_e8m0_to_fp32_half(blocks[:, 0:1]) * _fp4_levels(nibbles)).to(dtype)
+
+
+def _ue4m3_to_fp32(x: torch.Tensor) -> torch.Tensor:
+    """A UE4M3 byte (NVFP4's scale) -> float32."""
+    x = x.to(torch.int32)
+    exp = (x >> 3) & 0x0F
+    man = (x & 0x07).to(torch.float32)
+    raw = torch.where(
+        exp == 0,
+        man * 2.0**-9,
+        (1.0 + man / 8.0) * torch.pow(torch.tensor(2.0, device=x.device), exp.to(torch.float32) - 7.0),
+    )
+    return torch.where((x == 0) | (x == 0x7F), torch.zeros((), device=x.device, dtype=torch.float32), raw * 0.5)
+
+
+def _dequant_nvfp4(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    nb = blocks.shape[0]
+    scale = _ue4m3_to_fp32(blocks[:, 0:4]).reshape(nb, 4, 1)
+    nibbles = _shifted(blocks[:, 4:36], (0, 4), 8).reshape(nb, 4, 16) & 0xF
+    return (scale * _fp4_levels(nibbles)).reshape(nb, -1).to(dtype)
+
+
 _DEQUANT = {
     GGML_Q4_0: _dequant_q4_0,
     GGML_Q4_1: _dequant_q4_1,
+    GGML_Q5_0: _dequant_q5_0,
+    GGML_Q5_1: _dequant_q5_1,
     GGML_Q8_0: _dequant_q8_0,
     GGML_Q2_K: _dequant_q2_k,
     GGML_Q3_K: _dequant_q3_k,
@@ -703,4 +792,8 @@ _DEQUANT = {
     GGML_IQ2_S: _dequant_iq2_s,
     GGML_IQ1_M: _dequant_iq1_m,
     GGML_IQ4_XS: _dequant_iq4_xs,
+    GGML_TQ1_0: _dequant_tq1_0,
+    GGML_TQ2_0: _dequant_tq2_0,
+    GGML_MXFP4: _dequant_mxfp4,
+    GGML_NVFP4: _dequant_nvfp4,
 }
