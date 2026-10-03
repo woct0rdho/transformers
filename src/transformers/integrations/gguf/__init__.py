@@ -20,12 +20,12 @@ _import_structure = {
     "gguf_config_mapping": ["GGUF_CONFIG_ARCHS", "get_gguf_config"],
     "gguf_conversion_mapping": ["GGUF_ARCHS"],
     "gguf_tokenizer_mapping": ["GGUF_TOKENIZER_MAPPING", "convert_gguf_tokenizer", "get_gguf_tokenizer"],
+    "modules": ["replace_with_gguf_modules"],
     "reader": ["GgufHeader", "load_gguf_state_dict", "read_gguf_metadata"],
     "utils": [
         "get_gguf_conversion_mapping",
         "get_gguf_plan",
         "is_gguf_arch_supported",
-        "replace_with_gguf_modules",
     ],
 }
 
@@ -33,12 +33,12 @@ if TYPE_CHECKING:
     from .gguf_config_mapping import GGUF_CONFIG_ARCHS, get_gguf_config
     from .gguf_conversion_mapping import GGUF_ARCHS
     from .gguf_tokenizer_mapping import GGUF_TOKENIZER_MAPPING, convert_gguf_tokenizer, get_gguf_tokenizer
+    from .modules import replace_with_gguf_modules
     from .reader import GgufHeader, load_gguf_state_dict, read_gguf_metadata
     from .utils import (
         get_gguf_conversion_mapping,
         get_gguf_plan,
         is_gguf_arch_supported,
-        replace_with_gguf_modules,
     )
 else:
     import sys
