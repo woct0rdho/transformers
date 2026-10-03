@@ -378,7 +378,7 @@ class GgufIntegrationTest(unittest.TestCase):
 
     @staticmethod
     def packed_modules(model):
-        from transformers.integrations.gguf.utils import GgufEmbedding, GgufLinear
+        from transformers.integrations.gguf.modules import GgufEmbedding, GgufLinear
 
         return [module for module in model.modules() if isinstance(module, (GgufLinear, GgufEmbedding))]
 
