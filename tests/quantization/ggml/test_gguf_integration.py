@@ -51,18 +51,78 @@ class GgufDequantizeTest(unittest.TestCase):
         from gguf.constants import GGMLQuantizationType
         from gguf.quants import dequantize as reference
 
-        from transformers.integrations.gguf.dequant import GGML_BLOCK, GGML_NAME, dequantize
+        from transformers.integrations.gguf.dequant import GGML_BLOCK, GGML_NAME, GGML_Q2_0, dequantize
 
+        # gguf-py has no numpy decoder for these types; `Q2_0ReferenceTest` covers them from the C source
+        no_reference = {GGML_Q2_0}
         # Random bytes rather than a real file: they cover the whole space a block can hold, scales
         # included, so a layout that is only wrong for some inputs still shows up.
         generator = torch.Generator().manual_seed(0)
         for ggml_type, (_, block_bytes) in sorted(GGML_BLOCK.items()):
             with self.subTest(type=GGML_NAME[ggml_type]):
+                try:
+                    reference_type = GGMLQuantizationType(ggml_type)
+                except ValueError:
+                    self.assertIn(ggml_type, no_reference)
+                    continue
                 blocks = torch.randint(0, 256, (128, block_bytes), dtype=torch.uint8, generator=generator)
                 ours = dequantize(blocks.reshape(-1), ggml_type, torch.float32).numpy()
-                theirs = reference(blocks.numpy().reshape(-1).copy(), GGMLQuantizationType(ggml_type))
+                theirs = reference(blocks.numpy().reshape(-1).copy(), reference_type)
                 # `equal_nan`: a random scale can be a NaN, and both sides must produce the same one
                 self.assertTrue(np.array_equal(ours, theirs.reshape(-1)[: ours.size], equal_nan=True))
+
+
+class Q2_0ReferenceTest(unittest.TestCase):
+    """Q2_0 unpacks to what `dequantize_row_q2_0` in ggml-quants.c produces.
+
+    gguf-py carries the type id but no numpy decoder, so the reference is written out here, from the
+    C source: a block is an fp16 scale, then sixteen bytes holding four *consecutive* 2-bit codes
+    each, lowest bits first, and a code `q` is the level `q - 1`.
+    """
+
+    def _numpy_reference(self, payload, blocks: int):
+        """`payload` (a multiple of 18 bytes) -> the C function's output, written natively in numpy."""
+        import numpy as np
+
+        block = payload.reshape(blocks, 18)
+        scale = block[:, 0:2].copy().view(np.float16).astype(np.float32).reshape(blocks, 1)
+        out = np.empty((blocks, 64), dtype=np.float32)
+        for j in range(64):
+            out[:, j] = ((block[:, 2 + j // 4] >> ((j % 4) * 2)) & 0x03).astype(np.int32) - 1
+        return (out * scale).reshape(-1)
+
+    @require_gguf
+    def test_every_code_round_trips_at_the_block_scale(self):
+        import numpy as np
+
+        from transformers.integrations.gguf.dequant import GGML_Q2_0, dequantize
+
+        # d = 2 with one repeated code per block, so every weight reads `level * 2`
+        for code, level in ((0b00000000, -1), (0b01010101, 0), (0b10101010, 1), (0b11111111, 2)):
+            block = np.zeros(18, dtype=np.uint8)
+            block[0:2] = np.frombuffer(np.float16(2.0).tobytes(), dtype=np.uint8)
+            block[2:18] = code
+            values = dequantize(torch.from_numpy(block), GGML_Q2_0, torch.float32)
+            self.assertTrue(torch.equal(values, torch.full((64,), level * 2.0)))
+
+    @require_gguf
+    def test_matches_the_c_reference(self):
+        import numpy as np
+
+        from transformers.integrations.gguf.dequant import GGML_Q2_0, dequantize
+
+        generator = torch.Generator().manual_seed(0)
+        blocks = torch.randint(0, 256, (512, 18), dtype=torch.uint8, generator=generator)
+        # a finite scale in every block: NaN payloads are equal_nan's business, not the layout's
+        blocks[:, 0:2] = torch.tensor(list(np.float16(1.0).tobytes()), dtype=torch.uint8)
+        ours = dequantize(blocks.reshape(-1), GGML_Q2_0, torch.float32).numpy()
+        theirs = self._numpy_reference(blocks.numpy().reshape(-1).copy(), 512)
+        self.assertTrue(np.array_equal(ours, theirs))
+
+        random = torch.randint(0, 256, (512, 18), dtype=torch.uint8, generator=generator)
+        ours = dequantize(random.reshape(-1), GGML_Q2_0, torch.float32).numpy()
+        theirs = self._numpy_reference(random.numpy().reshape(-1).copy(), 512)
+        self.assertTrue(np.array_equal(ours, theirs, equal_nan=True))
 
 
 class GgufTokenizerTesterMixin:

@@ -30,6 +30,7 @@ GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ3_XXS, GGML_IQ1_S = 16, 17, 18, 19
 GGML_IQ4_NL, GGML_IQ3_S, GGML_IQ2_S, GGML_IQ4_XS, GGML_IQ1_M = 20, 21, 22, 23, 29
 GGML_TQ1_0, GGML_TQ2_0 = 34, 35
 GGML_MXFP4, GGML_NVFP4 = 39, 40
+GGML_Q2_0 = 42
 
 # ggml type id -> (elements per block, bytes per block)
 GGML_BLOCK = {
@@ -56,6 +57,7 @@ GGML_BLOCK = {
     GGML_TQ2_0: (256, 66),
     GGML_MXFP4: (32, 17),
     GGML_NVFP4: (64, 36),
+    GGML_Q2_0: (64, 18),
 }
 
 
@@ -89,6 +91,7 @@ GGML_NAME = {
     GGML_TQ2_0: "TQ2_0",
     GGML_MXFP4: "MXFP4",
     GGML_NVFP4: "NVFP4",
+    GGML_Q2_0: "Q2_0",
 }
 
 # The 16 levels an IQ4 nibble indexes, shared by IQ4_NL and IQ4_XS (ggml's `kvalues_iq4nl`).
@@ -170,6 +173,13 @@ def _dequant_q6_k(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     high = (_shifted(qh, (0, 2, 4, 6), 32) & 3).reshape(nb, -1, 32)
     quants = (low | (high << 4)).to(torch.int8) - 32
     return (scale * quants.reshape(nb, 16, -1)).reshape(nb, -1).to(dtype)
+
+
+def _dequant_q2_0(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    # unlike q4_0's two half-width planes, each byte holds four *consecutive* 2-bit codes, and a
+    # code is the level `code - 1` (`dequantize_row_q2_0` in ggml-quants.c)
+    codes = _shifted(blocks[:, 2:18], (0, 2, 4, 6), 1) & 3
+    return (_half(blocks, 0) * (codes.to(torch.int8).reshape(blocks.shape[0], -1) - 1)).to(dtype)
 
 
 def _dequant_q4_0(blocks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -796,4 +806,5 @@ _DEQUANT = {
     GGML_TQ2_0: _dequant_tq2_0,
     GGML_MXFP4: _dequant_mxfp4,
     GGML_NVFP4: _dequant_nvfp4,
+    GGML_Q2_0: _dequant_q2_0,
 }
