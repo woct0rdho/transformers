@@ -2098,13 +2098,16 @@ class GgufConfig(QuantizationConfigMixin):
             gives up the memory saving; the persistent path dequantizes per operation instead, so this
             is an explicit choice rather than a fallback.
         mmap_policy (`str`, *optional*, defaults to `"keep"`):
-            Keep GGUF file pages resident after loading (`"keep"`) or release complete tensor pages
-            after the loader has detached them (`"release"`).
+            How the file's tensor bytes are read, and whether its pages stay resident afterwards. `"keep"`
+            reads through a memory map and leaves the pages cached; `"release"` reads through the map and asks
+            the kernel to drop each tensor's pages once the loader has detached them; `"pread"` reads each
+            tensor's bytes into its own buffer with `pread` -- one bulk request per tensor instead of a page
+            fault per mapped page -- and drops the pages after use. `"pread"` needs `os.preadv`.
     """
 
     def __init__(self, gguf_file: str | None = None, dequantize: bool = False, mmap_policy: str = "keep", **kwargs):
-        if mmap_policy not in {"keep", "release"}:
-            raise ValueError(f"GGUF mmap policy must be 'keep' or 'release', got {mmap_policy!r}")
+        if mmap_policy not in {"keep", "release", "pread"}:
+            raise ValueError(f"GGUF mmap policy must be 'keep', 'release' or 'pread', got {mmap_policy!r}")
         self.quant_method = QuantizationMethod.GGUF
         self.gguf_file = gguf_file
         self.dequantize = dequantize
