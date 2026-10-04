@@ -4056,9 +4056,11 @@ class PreTrainedModel(
                 files are read fully into memory and parsed with `safetensors.torch.load`. When `False`, the
                 default memory-mapped loader is always used.
             gguf_mmap_policy (`str`, *optional*, defaults to `"keep"`):
-                Controls GGUF source-page residency during model loading. `"keep"` retains normal mmap behavior;
-                `"release"` copies materialized tensors to independent storage before advising the operating system
-                to evict complete source pages.
+                Controls how GGUF tensor bytes are read and whether source pages stay resident during model
+                loading. `"keep"` reads through a memory map and retains normal page behavior; `"release"` copies
+                materialized tensors to independent storage before advising the operating system to evict complete
+                source pages; `"pread"` reads each tensor into its own buffer with `pread` and evicts the pages
+                after use, which avoids page faults entirely on large files (`os.preadv` required).
             fusion_config (`dict[str, bool | dict[str, Any]]`, *optional*):
                 Optional fusion configuration applied before model instantiation. Each key enables a fusion family and
                 its value can either be `True` to enable that fusion with default options or a dictionary of
@@ -4208,8 +4210,8 @@ class PreTrainedModel(
 
         if gguf_file is not None and not is_accelerate_available():
             raise ValueError("accelerate is required when loading a GGUF file `pip install accelerate`.")
-        if gguf_mmap_policy not in {"keep", "release"}:
-            raise ValueError(f"GGUF mmap policy must be 'keep' or 'release', got {gguf_mmap_policy!r}")
+        if gguf_mmap_policy not in {"keep", "release", "pread"}:
+            raise ValueError(f"GGUF mmap policy must be 'keep', 'release' or 'pread', got {gguf_mmap_policy!r}")
         if gguf_file is None and gguf_mmap_policy != "keep":
             raise ValueError("`gguf_mmap_policy` can only be used when loading a `gguf_file`.")
 
