@@ -343,7 +343,8 @@ def get_hf_quantizer(
             quantization_config = GgufConfig(gguf_file=gguf_file, mmap_policy=gguf_mmap_policy or "keep")
         elif isinstance(quantization_config, GgufConfig):
             quantization_config.gguf_file = gguf_file
-            if gguf_mmap_policy == "release":
+            # An explicit policy overrides the one the passed config carries; the default does not.
+            if gguf_mmap_policy not in (None, "keep"):
                 quantization_config.mmap_policy = gguf_mmap_policy
     elif isinstance(quantization_config, GgufConfig):
         raise ValueError(

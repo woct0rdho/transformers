@@ -9,8 +9,10 @@ from transformers.utils.quantization_config import GgufConfig
 
 class GgufMmapConfigTests(unittest.TestCase):
     def test_config_validates_and_serializes_mmap_policy(self):
-        config = GgufConfig(mmap_policy="release")
-        self.assertEqual(config.get_loading_attributes(), {"mmap_policy": "release"})
+        for policy in ("release", "pread"):
+            with self.subTest(policy=policy):
+                config = GgufConfig(mmap_policy=policy)
+                self.assertEqual(config.get_loading_attributes(), {"mmap_policy": policy})
         with self.assertRaisesRegex(ValueError, "mmap policy"):
             GgufConfig(mmap_policy="invalid")
 

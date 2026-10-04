@@ -243,19 +243,25 @@ class LazyGgufTensor:
 
     def __init__(
         self,
-        data: np.ndarray,
+        data: np.ndarray | None,
         ggml_type: int,
         shape: tuple[int, ...],
         logical_shape: tuple[int, ...] | None = None,
         releaser=None,
         offset: int = 0,
+        reader: "_GgufFileReader | None" = None,
+        nbytes: int = 0,
     ):
-        self.data = data  # a read-only mmap view, untouched until materialized
+        # `data` is a read-only mmap view, untouched until materialized. Under the `pread` policy there is no
+        # mapping at all and the bytes come from `reader` instead, so `data` is None and `nbytes` is the length.
+        self.data = data
         self.ggml_type = ggml_type
         self.shape = shape
         self.logical_shape = logical_shape or shape
         self._releaser = releaser
         self._offset = offset
+        self._reader = reader
+        self._nbytes = nbytes or (0 if data is None else data.nbytes)
         self._remaining_materializations = None
         self._release_lock = threading.Lock()
 
@@ -271,9 +277,7 @@ class LazyGgufTensor:
     def __getitem__(self, key) -> torch.Tensor:
         if self.ggml_type not in _TORCH_DTYPE and key is not Ellipsis:
             raise ValueError("Slicing a packed GGUF tensor is unsupported unless the complete tensor is selected")
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
-            raw = torch.from_numpy(np.ascontiguousarray(self.data))
+        raw = self._materialized_bytes()
         if self.ggml_type not in _TORCH_DTYPE:
             return GgufQuantizedParameter(raw.reshape(self.shape), self.ggml_type, self.logical_shape)
         # The file is mapped as bytes, since numpy has no bfloat16, so the values are reinterpreted here.
@@ -282,6 +286,17 @@ class LazyGgufTensor:
         # weight. `Cast` is the last op of every chain, so this lands in the model's dtype anyway.
         values = raw.view(_TORCH_DTYPE[self.ggml_type]).reshape(self.shape)
         return values[key]
+
+    def _materialized_bytes(self) -> torch.Tensor:
+        """This tensor's bytes, read with `pread` when there is a reader and taken from the mapping otherwise."""
+        if self._reader is not None:
+            # One bulk request per tensor rather than one page fault per mapped page, which matters on files
+            # big enough that faults arrive slower than the device transfers spanning them. The returned
+            # buffer is kept alive by the tensor, so the source pages are not needed again after this read.
+            return self._reader.read(self._offset, self._nbytes)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
+            return torch.from_numpy(np.ascontiguousarray(self.data))
 
     @property
     def release_after_materialization(self):
@@ -296,14 +311,19 @@ class LazyGgufTensor:
             self._remaining_materializations = count
 
     def is_materialized_view(self, tensor):
+        if self._reader is not None:
+            # The bytes were read into their own buffer, so no source page is shared with this tensor.
+            return False
+        data = self.data
+        assert data is not None  # a source without a reader always holds its mapping
         if tensor.device.type != "cpu" or tensor.numel() == 0:
             return False
         try:
             pointer = tensor.data_ptr()
         except RuntimeError:
             return False
-        source = int(self.data.__array_interface__["data"][0])
-        return source <= pointer < source + self.data.nbytes
+        source = int(data.__array_interface__["data"][0])
+        return source <= pointer < source + data.nbytes
 
     def _release_after_materialization(self):
         with self._release_lock:
@@ -313,7 +333,7 @@ class LazyGgufTensor:
             self._remaining_materializations = remaining - 1
             should_release = remaining == 1
         if should_release:
-            self._releaser.release(self._offset, self.data.nbytes)
+            self._releaser.release(self._offset, self._nbytes)
 
 
 def _page_aligned_interior(offset: int, length: int, page_size: int):
@@ -322,10 +342,64 @@ def _page_aligned_interior(offset: int, length: int, page_size: int):
     return (start, end - start) if end > start else None
 
 
+class _GgufFileReader:
+    """Reads tensor ranges with `pread`, so a load never depends on mapped pages or their faults.
+
+    A buffered `pread` of a whole tensor is what the kernel can turn into large requests, while a mapping only
+    faults in what the copy touches, and the two are not equally fast on current kernels and devices. The
+    buffer is pinned whenever a device is present, which turns the transfer that follows into a direct DMA
+    instead of a driver-side copy through a bounce buffer.
+
+    Pinning is what makes this policy fast, but the host caching allocator retains a freed pinned block for
+    its size class, and on a unified-memory device those blocks are charged to the same pool as the model. A
+    single read of a 28.8 GB tensor leaves a 32 GiB pinned block resident for the rest of the process, which
+    is enough to push a 61.85 GiB checkpoint's pool into reclaim during training. A read above
+    `pinned_staging_limit` is staged in a pageable buffer instead, so it costs one read its DMA and leaves
+    every other read on the pinned path.
+    """
+
+    # Reads larger than this are staged in a pageable buffer. The largest tensor of a checkpoint is
+    # the one whose cached pinned block would dominate the pool. Everything else stays pinned.
+    PINNED_STAGING_LIMIT_BYTES = 1 << 30
+
+    def __init__(self, path, pinned_staging_limit: int | None = None):
+        self._fd = os.open(os.fspath(path), os.O_RDONLY)
+        self._pin = torch.cuda.is_available()
+        self._pinned_staging_limit = (
+            self.PINNED_STAGING_LIMIT_BYTES if pinned_staging_limit is None else pinned_staging_limit
+        )
+
+    def read(self, offset: int, length: int) -> torch.Tensor:
+        pinned = self._pin and length <= self._pinned_staging_limit
+        try:
+            buffer = torch.empty(length, dtype=torch.uint8, pin_memory=pinned)
+        except RuntimeError:  # a locked-memory limit can refuse the pinning. A plain buffer still works
+            buffer = torch.empty(length, dtype=torch.uint8)
+        view = memoryview(buffer.numpy())
+        done = 0
+        while done < length:
+            read = os.preadv(self._fd, [view[done:]], offset + done)
+            if read <= 0:
+                raise OSError(f"GGUF file ended after {done} of {length} bytes at offset {offset}")
+            done += read
+        return buffer
+
+    def close(self):
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except (AttributeError, OSError):
+            pass
+
+
 class _GgufFileRangeReleaser:
-    def __init__(self, path, mapped_array):
-        mapped_file = getattr(mapped_array, "_mmap", None)
-        if mapped_file is None or not hasattr(mapped_file, "madvise") or not hasattr(mmap, "MADV_DONTNEED"):
+    def __init__(self, path, mapped_array=None):
+        mapped_file = getattr(mapped_array, "_mmap", None) if mapped_array is not None else None
+        if mapped_file is not None and not (hasattr(mapped_file, "madvise") and hasattr(mmap, "MADV_DONTNEED")):
             raise RuntimeError("GGUF mmap page release requires mmap.madvise(MADV_DONTNEED) support")
         self._mapped_file = mapped_file
         self._page_size = mmap.PAGESIZE
@@ -342,7 +416,8 @@ class _GgufFileRangeReleaser:
             return
         start, size = aligned
         with self._lock:
-            self._mapped_file.madvise(mmap.MADV_DONTNEED, start, size)
+            if self._mapped_file is not None:
+                self._mapped_file.madvise(mmap.MADV_DONTNEED, start, size)
             if self._fd is not None:
                 os.posix_fadvise(self._fd, start, size, os.POSIX_FADV_DONTNEED)
 
@@ -360,10 +435,15 @@ class _GgufFileRangeReleaser:
 
 def load_gguf_state_dict(header: GgufHeader, mmap_policy: str = "keep") -> dict[str, LazyGgufTensor]:
     """`{gguf_name: LazyGgufTensor}` — the file's tensors, none of them read yet."""
-    if mmap_policy not in {"keep", "release"}:
-        raise ValueError(f"GGUF mmap policy must be 'keep' or 'release', got {mmap_policy!r}")
-    blob = _mapped(header.path)
-    releaser = _GgufFileRangeReleaser(header.path, blob) if mmap_policy == "release" else None
+    if mmap_policy not in {"keep", "release", "pread"}:
+        raise ValueError(f"GGUF mmap policy must be 'keep', 'release' or 'pread', got {mmap_policy!r}")
+    if mmap_policy == "pread" and not hasattr(os, "preadv"):
+        raise ValueError("The GGUF 'pread' policy needs os.preadv, which this platform does not provide")
+
+    # `pread` reads each tensor into its own buffer, so it needs no mapping and no mapped-pages release.
+    reader = _GgufFileReader(header.path) if mmap_policy == "pread" else None
+    blob = None if reader is not None else _mapped(header.path)
+    releaser = None if mmap_policy == "keep" else _GgufFileRangeReleaser(header.path, blob)
 
     state_dict = {}
     for info in header.tensors:
@@ -376,7 +456,14 @@ def load_gguf_state_dict(header: GgufHeader, mmap_policy: str = "keep") -> dict[
             shape = (*shape[:-1], shape[-1] // block_elements * block_bytes)
         start = header.data_start + info.offset
         state_dict[info.name] = LazyGgufTensor(
-            blob[start : start + info.nbytes], info.ggml_type, shape, logical_shape, releaser, start
+            None if reader is not None else blob[start : start + info.nbytes],
+            info.ggml_type,
+            shape,
+            logical_shape,
+            releaser,
+            start,
+            reader=reader,
+            nbytes=info.nbytes,
         )
 
     return state_dict

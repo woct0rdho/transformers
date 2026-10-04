@@ -2,6 +2,8 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 
+import os
+import tempfile
 import unittest
 
 import numpy as np
@@ -9,7 +11,14 @@ import torch
 
 from transformers.core_model_loading import _materialize_copy, _stage_releasable_source_for_accelerator
 from transformers.integrations.gguf.dequant import GGML_Q8_0
-from transformers.integrations.gguf.reader import LazyGgufTensor, _page_aligned_interior
+from transformers.integrations.gguf.reader import (
+    GgufHeader,
+    LazyGgufTensor,
+    TensorInfo,
+    _GgufFileReader,
+    _page_aligned_interior,
+    load_gguf_state_dict,
+)
 
 
 class GgufMmapTests(unittest.TestCase):
@@ -60,6 +69,45 @@ class GgufMmapTests(unittest.TestCase):
         self.assertEqual(staged.device.type, "cpu")
         self.assertIsNot(staged, tensor)
         self.assertTrue(torch.equal(staged, tensor))
+
+    def test_accelerator_staging_leaves_a_source_that_owns_its_bytes_alone(self):
+        class Source:
+            def release_after_materialization(self):
+                pass
+
+            def is_materialized_view(self, tensor):
+                return False
+
+        tensor = torch.ones(3)
+        staged = _stage_releasable_source_for_accelerator(Source(), tensor, torch.device("cuda"))
+        self.assertIs(staged, tensor)
+
+    def test_pread_source_reads_its_range_and_shares_no_mapped_page(self):
+        values = np.arange(8, dtype=np.float32)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "tiny.gguf")
+            with open(path, "wb") as handle:
+                handle.write(values.tobytes())
+            mapped = LazyGgufTensor(np.memmap(path, mode="r", dtype=np.uint8), 0, (8,))
+            source = load_gguf_state_dict(
+                GgufHeader(path, "synthetic", (TensorInfo("blk.0.weight", (8,), 0, 0, values.nbytes),), 0),
+                mmap_policy="pread",
+            )["blk.0.weight"]
+
+            self.assertTrue(torch.equal(source[...], mapped[...]))
+            self.assertTrue(torch.equal(source[...], torch.from_numpy(values)))
+            self.assertFalse(source.is_materialized_view(source[...]))
+            with self.assertRaisesRegex(ValueError, "mmap policy"):
+                load_gguf_state_dict(GgufHeader(path, "synthetic", (), 0), mmap_policy="invalid")
+
+    def test_pread_reader_rejects_a_file_that_ends_early(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "short.bin")
+            with open(path, "wb") as handle:
+                handle.write(b"\x00" * 4)
+            reader = _GgufFileReader(path)
+            with self.assertRaisesRegex(OSError, "ended after"):
+                reader.read(0, 16)
 
 
 if __name__ == "__main__":
