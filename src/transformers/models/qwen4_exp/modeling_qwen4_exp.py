@@ -1284,7 +1284,9 @@ class Qwen4ExpTextPLELayer(nn.Module):
         key_normed = self.norm_key(self.key_proj(embeddings)).unflatten(-1, (self.hc_count, self.hidden_size))
         value = self.value_proj(embeddings)
         query_normed = self.norm_query(hidden_states).unflatten(-1, (self.hc_count, self.hidden_size))
-        gate = (key_normed * query_normed).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
+        # Keep the gate in the activation dtype. Autocast runs `sum` in FP32, and an FP32 gate
+        # would promote this layer's output, and with it the whole residual stream, to FP32.
+        gate = (key_normed * query_normed).sum(dim=-1, keepdim=True, dtype=key_normed.dtype) / math.sqrt(self.hidden_size)
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
         gated_value = torch.sigmoid(gate) * value.unsqueeze(-2)
         gated_value_normed = self.norm_conv(gated_value.flatten(-2))
